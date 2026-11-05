@@ -859,6 +859,11 @@ func equalItems(frame *equalFrame, eq equality) (bool, error) {
 				if !path.enter(child.self) {
 					return false, nil
 				}
+				// Opening a pair can allocate its items, and a value sharing
+				// containers at many levels opens exponentially many.
+				if err := eq.env.Charge(callBytes + ElementBytes*int64(len(child.a)+len(child.b))); err != nil {
+					return false, err
+				}
 				stack = append(stack, *frame)
 				*frame = child
 			}

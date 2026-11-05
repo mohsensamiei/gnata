@@ -48,6 +48,9 @@ type transformClone struct {
 // public boundary returns it as a Go map again. It polls env, since shared
 // subtrees make the copy exponential in the expression's size.
 func (c *transformClone) clone(v any) (any, error) {
+	if err := c.env.ChargeCopy(v); err != nil {
+		return nil, err
+	}
 	return copyTree(v, c, &valuePath{what: "clone"})
 }
 
@@ -217,6 +220,9 @@ func (d *detacher) copy(v any) (any, error) {
 		key := containerKey(v)
 		if cp, ok := d.copies[key]; ok {
 			return cp, false, nil
+		}
+		if err := d.env.Charge(ShallowSize(v)); err != nil {
+			return nil, false, err
 		}
 		if om, ok := v.(*OrderedMap); ok {
 			m := NewOrderedMapWithCapacity(len(om.keys))

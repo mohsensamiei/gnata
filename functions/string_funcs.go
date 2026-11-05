@@ -73,22 +73,33 @@ func valueToString(v any, prettify bool, env *evaluator.Environment) (string, er
 	case nil:
 		return "", nil // undefined → caller returns nil
 	default:
+		charged, err := env.ChargeStringify(v)
+		if err != nil {
+			return "", err
+		}
 		prepared, err := evaluator.JSONValue(v, env)
 		if err != nil {
 			return "", err
 		}
-		out, err := evaluator.AppendJSON(nil, prepared)
+		out, err := evaluator.AppendJSON(evaluator.JSONBuffer(charged), prepared)
 		if err != nil {
 			return "", &evaluator.JSONataError{Code: "D1001", Message: "Number out of range"}
 		}
 		if prettify {
+			// json.Indent allocates about eight times the indented text in all
+			// (measured): its reformatted strings, its growing buffer and the
+			// string made from it.
+			indented := int64(len(out)) + evaluator.IndentBound(v, env.Remaining())
+			if err := env.Charge(8 * indented); err != nil {
+				return "", err
+			}
 			var buf bytes.Buffer
 			if err := json.Indent(&buf, out, "", "  "); err != nil {
 				return "", &evaluator.JSONataError{Code: "D1001", Message: "Number out of range"}
 			}
-			return buf.String(), nil
+			return buf.String(), env.Settle(charged, 0)
 		}
-		return string(out), nil
+		return string(out), env.Settle(charged, int64(len(out)))
 	}
 }
 
@@ -371,7 +382,7 @@ func fnContains(args []any, focus any) (any, error) {
 
 // ── $split ────────────────────────────────────────────────────────────────────
 
-func fnSplit(args []any, _ any) (any, error) {
+func fnSplit(args []any, _ any, env *evaluator.Environment) (any, error) {
 	if len(args) == 0 {
 		return nil, &evaluator.JSONataError{Code: "D3006", Message: "$split: requires at least 2 arguments"}
 	}
@@ -409,7 +420,7 @@ func fnSplit(args []any, _ any) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		if parts, err = splitRegex(re, s, matchCountLimit(limitArg)); err != nil {
+		if parts, err = splitRegex(re, s, matchCountLimit(limitArg), env); err != nil {
 			return nil, err
 		}
 	default:

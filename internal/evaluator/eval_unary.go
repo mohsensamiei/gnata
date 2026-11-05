@@ -53,6 +53,14 @@ func evalUnary(node *parser.Node, input any, env *Environment) (any, error) {
 					return nil, err
 				}
 			}
+			// The first items appended are allocated at their size at once.
+			perItem := int64(ElementBytes)
+			if len(result) == 0 {
+				perItem = SlotBytes
+			}
+			if err := env.Charge(constructedItems(val, isExplicitArray) * perItem); err != nil {
+				return nil, err
+			}
 			switch v := val.(type) {
 			case *Sequence:
 				if v.ConsArray || isExplicitArray {
@@ -97,6 +105,9 @@ func evalObjectConstructor(node *parser.Node, input any, env *Environment) (any,
 		}
 		env = unwrapRoot(env)
 	}
+	if err := env.Charge(ObjectBytes); err != nil {
+		return nil, err
+	}
 	result := NewOrderedMap()
 	for i := 0; i+1 < len(node.LHS()); i += 2 {
 		keyNode := node.LHS()[i]
@@ -126,6 +137,9 @@ func evalObjectConstructor(node *parser.Node, input any, env *Environment) (any,
 		if val == nil {
 			continue
 		}
+		if err := env.Charge(EntryBytes + int64(len(key))); err != nil {
+			return nil, err
+		}
 		result.Set(key, val)
 	}
 	return result, nil
@@ -139,4 +153,19 @@ func isArrayConstructor(n *parser.Node) bool {
 		n = n.Left
 	}
 	return n.Type == parser.NodeUnary && n.Value == "["
+}
+
+// constructedItems is how many items an array constructor appends for val,
+// the value of one of its expressions.
+func constructedItems(val any, explicit bool) int64 {
+	if seq, ok := val.(*Sequence); ok && !seq.ConsArray && !explicit {
+		return int64(len(seq.Values))
+	}
+	if _, ok := val.(*Sequence); ok || explicit {
+		return 1
+	}
+	if arr, ok := AsArray(val); ok {
+		return int64(len(arr))
+	}
+	return 1
 }

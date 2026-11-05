@@ -90,6 +90,9 @@ func evalChain(right *parser.Node, piped any, pipedShape argShape, input any, en
 }
 
 func evalBlock(node *parser.Node, input any, env *Environment) (any, error) {
+	if err := env.Charge(ScopeBytes); err != nil {
+		return nil, err
+	}
 	childEnv := NewChildEnvironment(env)
 	var last any
 	for _, expr := range node.Expressions() {

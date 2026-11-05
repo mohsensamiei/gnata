@@ -141,6 +141,9 @@ func evalBinary(node *parser.Node, input any, env *Environment) (any, error) { /
 		if err != nil {
 			return nil, err
 		}
+		if err := env.Charge(int64(len(ls) + len(rs))); err != nil {
+			return nil, err
+		}
 		return ls + rs, nil
 
 	case "=", "!=":

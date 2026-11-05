@@ -703,6 +703,9 @@ func evalLambdaBody(f *Lambda, args []any, plain plainArgs, focus any, env *Envi
 	if counter.depth > counter.max {
 		return nil, stackOverflowError(counter)
 	}
+	if err := env.Charge(ScopeBytes); err != nil {
+		return nil, err
+	}
 	childEnv := NewChildEnvironment(f.Closure)
 	childEnv.calls = counter
 	for i, param := range f.Params {
@@ -781,6 +784,26 @@ func plainArrayArgs(args []any) (out []any, copied bool) {
 	return out, copied
 }
 
+// callBuiltin calls the builtin f, charging the memory budget for it (see
+// SignedBuiltin.Cost).
+func callBuiltin(f *SignedBuiltin, args []any, focus any, env *Environment) (any, error) {
+	plain, typed := plainArrayArgs(args)
+	charged, err := chargeBuiltin(f, plain, env)
+	if err != nil {
+		return nil, err
+	}
+	var result any
+	if f.Plain != nil {
+		result, err = f.Plain(plain, focus)
+	} else {
+		result, err = f.Fn(plain, focus, env)
+	}
+	if err == nil {
+		err = settleBuiltin(charged, plain, result, env)
+	}
+	return builtinResult(args, typed, result, err)
+}
+
 // callWrapper calls a partial application, composition or argument wrapper,
 // which calls the function it wraps on the Go stack.
 func callWrapper(f *SignedBuiltin, args []any, focus any, env *Environment, counter *callCounter) (any, error) {
@@ -832,15 +855,7 @@ func invokeFunction(fn any, args []any, plain plainArgs, focus any, env *Environ
 		switch f := fn.(type) {
 		case *SignedBuiltin:
 			if !f.isWrapper() {
-				plain, typed := plainArrayArgs(args)
-				var result any
-				var err error
-				if f.Plain != nil {
-					result, err = f.Plain(plain, focus)
-				} else {
-					result, err = f.Fn(plain, focus, env)
-				}
-				return builtinResult(args, typed, result, err)
+				return callBuiltin(f, args, focus, env)
 			}
 			return callWrapper(f, args, focus, env, counter)
 		case BuiltinFunction:

@@ -171,6 +171,10 @@ func groupBy(pairs iter.Seq2[*parser.Node, *parser.Node], items []any, envs []*E
 			}
 			entry := byKey[key]
 			if entry == nil {
+				// The entry, its place in byKey and in the result.
+				if err := env.Charge(3*EntryBytes + int64(len(key))); err != nil {
+					return nil, err
+				}
 				entry = &groupEntry{key: key, pair: index, value: valNode}
 				byKey[key] = entry
 				order = append(order, entry)
@@ -178,6 +182,9 @@ func groupBy(pairs iter.Seq2[*parser.Node, *parser.Node], items []any, envs []*E
 				return nil, &JSONataError{Code: "D1009", Message: fmt.Sprintf("duplicate key: %q", key)}
 			}
 			if err := entry.size.add(item, itemEnv); err != nil {
+				return nil, err
+			}
+			if err := env.Charge(ElementBytes); err != nil {
 				return nil, err
 			}
 			entry.items = append(entry.items, item)

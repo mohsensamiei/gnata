@@ -48,6 +48,38 @@ type Group struct {
 
 // ── Regex methods ─────────────────────────────────────────────────────────────
 
+// ChargeMatches charges the memory budget for visiting every match of r in
+// s: the index slices FindStringMatch makes for them all at once, and each
+// match's own Match, groups and replacement (measured: about 280 bytes a
+// match without groups). It counts the matches first without keeping them.
+// A regex reading left context is counted on each suffix, which can only
+// find more matches.
+func (r *Regex) ChargeMatches(s string, env *Environment) error {
+	if !env.MemoryLimited() {
+		return nil
+	}
+	per := int64(320 + 48*(r.re.NumSubexp()+1))
+	limit := env.remaining()
+	var n int64
+	for pos := 0; pos <= len(s) && n <= limit; {
+		loc := r.re.FindStringIndex(s[pos:])
+		if loc == nil {
+			break
+		}
+		n += per
+		next := pos + loc[1]
+		if loc[0] == loc[1] {
+			if next >= len(s) {
+				break
+			}
+			_, width := utf8.DecodeRuneInString(s[next:])
+			next += width
+		}
+		pos = next
+	}
+	return env.Charge(n)
+}
+
 func (r *Regex) FindStringMatch(s string) (*Match, error) {
 	allLocs := r.re.FindAllStringSubmatchIndex(s, -1)
 	if len(allLocs) == 0 {

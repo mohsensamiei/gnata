@@ -372,8 +372,11 @@ expr, err := gnata.Compile(userExpr,
     gnata.WithStack(100),                // error D1011 beyond this recursion depth
     gnata.WithTimeout(500*time.Millisecond), // error D1012 if evaluation runs longer
     gnata.WithSequence(1_000_000),       // error D2015 if a built sequence grows past this
+    gnata.WithMemoryBudget(256<<20),     // error D1013 if evaluation allocates more than 256 MiB
 )
 ```
+
+`WithMemoryBudget` is a gnata extension with no jsonata-js counterpart. Go cannot cap the memory of one goroutine, so the evaluator charges each allocation whose size depends on the data (strings, arrays and objects it builds, regex matches, and the scope of each block and function call) before making it. A value that would exceed the budget fails with `D1013` before it is built, so a formula that doubles a string forty times stops at the doubling that crosses the budget instead of after one large concatenation no timeout can interrupt. Charges are never returned, so the budget bounds everything the evaluation allocates, garbage included, and the heap stays within about the budget whatever the garbage collector's timing; a long loop spends it even when it keeps little (a lambda call costs about 160 bytes). Decoding the input is not charged.
 
 `WithTimeout` is enforced by checking a deadline on every function call and periodically between expression nodes, rather than with a timer, so it also applies inside a synchronous call on single-threaded WebAssembly hosts. A single builtin or custom function call is not interrupted, so evaluation can exceed the timeout by at most the duration of the call in progress.
 

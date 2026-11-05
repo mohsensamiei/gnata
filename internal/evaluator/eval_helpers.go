@@ -54,15 +54,19 @@ func stringifyValue(v any, env *Environment) (string, error) {
 		if IsFunction(v) {
 			return "", nil
 		}
+		charged, err := env.ChargeStringify(v)
+		if err != nil {
+			return "", err
+		}
 		prepared, err := JSONValue(v, env)
 		if err != nil {
 			return "", err
 		}
-		b, err := AppendJSON(nil, prepared)
+		b, err := AppendJSON(JSONBuffer(charged), prepared)
 		if err != nil {
 			return "", fmt.Errorf("cannot stringify value: %w", err)
 		}
-		return string(b), nil
+		return string(b), env.Settle(charged, int64(len(b)))
 	}
 }
 
@@ -817,6 +821,11 @@ func (c *collector) visit() bool {
 // add collects v. Once * has appended an array value, jsonata-js's result
 // is a plain array whose pushes are not counted against WithSequence.
 func (c *collector) add(v any) {
+	if c.env.memoryLimited {
+		if c.err = c.env.Charge(ElementBytes); c.err != nil {
+			return
+		}
+	}
 	c.values = append(c.values, v)
 	if !c.fromArray {
 		c.err = c.env.CheckSequence(len(c.values))
