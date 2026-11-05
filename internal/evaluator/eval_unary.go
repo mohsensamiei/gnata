@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/recolabs/gnata/internal/decimal"
+	"github.com/recolabs/gnata/internal/errs"
 	"github.com/recolabs/gnata/internal/parser"
 )
 
@@ -24,10 +25,10 @@ func evalUnary(node *parser.Node, input any, env *Environment) (any, error) {
 		}
 		f, ok := ToFloat64(val)
 		if !ok {
-			return nil, &JSONataError{
+			return nil, errs.At(&JSONataError{
 				Code:    "D1002",
 				Message: fmt.Sprintf("the operand of the unary - operator must evaluate to a number, got %T", val),
-			}
+			}, node.Pos, "-", true)
 		}
 		return -f, nil
 
@@ -85,6 +86,11 @@ func evalUnary(node *parser.Node, input any, env *Environment) (any, error) {
 }
 
 func evalObjectConstructor(node *parser.Node, input any, env *Environment) (any, error) {
+	result, err := constructObject(node, input, env)
+	return result, keyErrorAt(err, node.Pos)
+}
+
+func constructObject(node *parser.Node, input any, env *Environment) (any, error) {
 	// As jsonata-js evaluateGroupExpression, an object constructor over an
 	// array groups its items, unless the array is the root input jsonata-js
 	// wraps as one item, which its pairs then see unwrapped.

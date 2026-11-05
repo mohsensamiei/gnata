@@ -3,6 +3,8 @@ package parser
 import (
 	"fmt"
 	"slices"
+
+	"github.com/recolabs/gnata/internal/errs"
 )
 
 // ParamSpec describes one parameter's type constraint parsed from a function signature.
@@ -37,7 +39,7 @@ func ParseSig(raw string) ([]ParamSpec, error) {
 			}
 		} else {
 			if !isValidSigType(s[i]) {
-				return nil, parseSigError("S0402", fmt.Sprintf("unknown type specifier %q in signature", s[i]))
+				return nil, parseSigError("S0402", i, fmt.Sprintf("unknown type specifier %q in signature", s[i]))
 			}
 			spec.Types = []byte{s[i]}
 			i++
@@ -78,21 +80,22 @@ func ParseSig(raw string) ([]ParamSpec, error) {
 
 // parseSigUnion parses a union group "(type...)" starting after the '('.
 func parseSigUnion(s string, i int) (types []byte, next int, _ error) {
+	open := i - 1 // jsonata-js reports a union's errors at its (
 	for i < len(s) && s[i] != ')' {
 		if s[i] == '<' {
-			return nil, 0, parseSigError("S0402", "content-type specifier '<' is not allowed inside a union type group")
+			return nil, 0, parseSigError("S0402", open, "content-type specifier '<' is not allowed inside a union type group")
 		}
 		if !isValidSigType(s[i]) {
-			return nil, 0, parseSigError("S0402", fmt.Sprintf("unknown type specifier %q in signature", s[i]))
+			return nil, 0, parseSigError("S0402", i, fmt.Sprintf("unknown type specifier %q in signature", s[i]))
 		}
 		types = append(types, s[i])
 		i++
 	}
 	if i >= len(s) {
-		return nil, 0, parseSigError("S0402", "unclosed union type group in signature")
+		return nil, 0, parseSigError("S0402", open, "unclosed union type group in signature")
 	}
 	if len(types) == 0 {
-		return nil, 0, parseSigError("S0402", "empty union type group in signature")
+		return nil, 0, parseSigError("S0402", open, "empty union type group in signature")
 	}
 	return types, i + 1, nil // +1 to consume ')'
 }
@@ -101,7 +104,7 @@ func parseSigUnion(s string, i int) (types []byte, next int, _ error) {
 func parseSigContentType(s string, i int, types []byte) (contentType byte, next int, _ error) {
 	for _, t := range types {
 		if t != 'a' && t != 'f' {
-			return 0, 0, parseSigError("S0401",
+			return 0, 0, parseSigError("S0401", i,
 				fmt.Sprintf("content-type specifier '<' is not valid for type %q", t))
 		}
 	}
@@ -123,7 +126,7 @@ func parseSigContentType(s string, i int, types []byte) (contentType byte, next 
 	}
 
 	if i >= len(s) || s[i] != '>' {
-		return 0, 0, parseSigError("S0402", "unclosed content-type specifier")
+		return 0, 0, parseSigError("S0402", i, "unclosed content-type specifier")
 	}
 	return contentType, i + 1, nil
 }
@@ -195,6 +198,8 @@ func isValidSigType(c byte) bool {
 	return false
 }
 
-func parseSigError(code, msg string) error {
-	return fmt.Errorf("JSONata error %s: %s", code, msg)
+// parseSigError returns a signature error at byte offset off of the
+// signature, without its outer < >; the parser places it in the expression.
+func parseSigError(code string, off int, msg string) error {
+	return errs.Syntax(code, "", off, msg, fmt.Sprintf("JSONata error %s: %s", code, msg))
 }

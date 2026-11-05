@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"slices"
 
+	"github.com/recolabs/gnata/internal/errs"
 	"github.com/recolabs/gnata/internal/parser"
 )
 
@@ -20,7 +21,8 @@ func evalFunction(node *parser.Node, input any, env *Environment) (any, error) {
 // *Sequence result, so a predicate on the call ($filter(...)[0]) sees the
 // sequence's items, matching jsonata-js.
 func evalFunctionSequence(node *parser.Node, input any, env *Environment) (any, error) {
-	fn, err := evalCallee(node.Procedure(), input, env)
+	site := callSiteOf(node)
+	fn, err := evalCallee(node.Procedure(), input, env, site)
 	if err != nil {
 		return nil, err
 	}
@@ -83,25 +85,31 @@ func evalFunctionSequence(node *parser.Node, input any, env *Environment) (any, 
 	// invokeFunction applies (see TailCall). A jsonata-js tail call to a
 	// built-in is one too, so its result is returned uncollapsed.
 	if node.Thunk() {
+		// A jsonata-js tail call reports its errors at its procedure; any
+		// other call trampolined here, at the call that entered the lambda.
+		var tail callSite
+		if node.TailContext() {
+			tail = tailSiteOf(node)
+		}
 		if wrapped {
-			return &TailCall{Fn: target, Args: args, Focus: Null, Plain: plain}, nil
+			return &TailCall{Fn: target, Args: args, Focus: Null, Plain: plain, Site: tail}, nil
 		}
 		if lambdaCall {
-			return &TailCall{Fn: fn, Args: args, Focus: callFocus, Plain: plain}, nil
+			return &TailCall{Fn: fn, Args: args, Focus: callFocus, Plain: plain, Site: tail}, nil
 		}
 		if node.TailContext() {
 			if len(args) > 0 {
 				plain = plain.with(0, args[0], shape)
 			}
-			return &TailCall{Fn: fn, Args: args, Focus: callFocus, Plain: plain}, nil
+			return &TailCall{Fn: fn, Args: args, Focus: callFocus, Plain: plain, Site: tail}, nil
 		}
 	}
 
 	var result any
 	if wrapped {
-		result, err = invokeFunction(target, args, plain, Null, env, true)
+		result, err = invokeFunction(target, args, plain, Null, env, true, site)
 	} else {
-		result, err = invokeFunction(fn, args, plain, callFocus, env, true)
+		result, err = invokeFunction(fn, args, plain, callFocus, env, true, site)
 	}
 	// A lambda's ArgShaped result is its tail call's, shaped there.
 	if seq, ok := result.(*Sequence); ok && seq.ArgShaped && !lambdaCall && !shape.sequence() {
@@ -110,8 +118,54 @@ func evalFunctionSequence(node *parser.Node, input any, env *Environment) (any, 
 	return result, err
 }
 
-// evalCallee evaluates a call's procedure, nil for none.
-func evalCallee(procedure *parser.Node, input any, env *Environment) (any, error) {
+// callSite is where jsonata-js reports an error raised by applying a
+// function: the byte offset of a call's ( or of a tail call's procedure,
+// and the function's name, which becomes the error's token if it has none.
+// The zero callSite reports nothing, as for a function a builtin calls back.
+type callSite struct {
+	pos int
+	tok string
+}
+
+// at places err at the call site.
+func (s callSite) at(err error) error {
+	return errs.At(err, s.pos, s.tok, false)
+}
+
+// callSiteOf is the site of the call node.
+func callSiteOf(node *parser.Node) callSite {
+	return callSite{pos: node.Pos, tok: procedureName(node.Procedure())}
+}
+
+// tailSiteOf is the site of the jsonata-js tail call node, which its
+// trampoline places at the procedure, named when it is a variable.
+func tailSiteOf(node *parser.Node) callSite {
+	proc := node.Procedure()
+	if proc == nil {
+		return callSite{}
+	}
+	site := callSite{pos: proc.Pos}
+	if proc.Type == parser.NodeVariable {
+		site.tok = proc.Value
+	}
+	return site
+}
+
+// procedureName is the name jsonata-js gives a call's procedure in errors:
+// a path's first step, or the procedure's value.
+func procedureName(proc *parser.Node) string {
+	if proc == nil || proc.Type == parser.NodeParent {
+		return ""
+	}
+	if proc.Type == parser.NodePath && len(proc.Steps()) > 0 {
+		return proc.Steps()[0].Value
+	}
+	return proc.Value
+}
+
+// evalCallee evaluates a call's procedure, nil for none, reporting a
+// function named without $ at site.
+func evalCallee(procedure *parser.Node, input any, env *Environment, site callSite) (any, error) {
 	if procedure == nil {
 		return nil, nil
 	}
@@ -130,10 +184,10 @@ func evalCallee(procedure *parser.Node, input any, env *Environment) (any, error
 	// If it's completely unknown (not in env either), return T1006.
 	if fn == nil && procedure.Type == parser.NodeName {
 		if envFn, found := env.Lookup(procedure.Value); found && envFn != nil {
-			return nil, &JSONataError{
+			return nil, errs.At(&JSONataError{
 				Code:    "T1005",
 				Message: fmt.Sprintf("attempted to invoke a function that has no definition: %s", procedure.Value),
-			}
+			}, site.pos, procedure.Value, true)
 		}
 	}
 	return fn, nil
@@ -348,7 +402,7 @@ func evalShapedChain(node *parser.Node, input any, env *Environment) (any, argSh
 	if err != nil {
 		return nil, argShape{}, err
 	}
-	return evalChain(node.Right, left, shape, input, env)
+	return evalChain(node.Right, left, shape, input, env, node.Pos)
 }
 
 // evalShapedSubscript is evalSubscriptValue, taking the shape of the
@@ -364,13 +418,13 @@ func evalShapedSubscript(node *parser.Node, input any, env *Environment) (any, a
 // callShaped calls fn with args, the first of shape first, as a call
 // expression does, returning the collapsed result and its shape (see
 // argShape).
-func callShaped(fn any, args []any, first argShape, focus any, env *Environment, keepArray bool) (any, argShape, error) {
+func callShaped(fn any, args []any, first argShape, focus any, env *Environment, keepArray bool, site callSite) (any, argShape, error) {
 	var plain plainArgs
 	lambdaCall := isLambda(fn)
 	if lambdaCall && len(args) > 0 {
 		plain = plain.with(0, args[0], first)
 	}
-	result, err := invokeFunction(fn, args, plain, focus, env, true)
+	result, err := invokeFunction(fn, args, plain, focus, env, true, site)
 	if err != nil {
 		return nil, argShape{}, err
 	}
@@ -509,6 +563,16 @@ func evalBody(f *Lambda, env *Environment, counter *callCounter) (any, error) {
 }
 
 func evalPartial(node *parser.Node, input any, env *Environment) (any, error) {
+	fn, err := evalPartialProc(node, input, env)
+	if err != nil {
+		// jsonata-js places these at the call, named after its procedure.
+		return nil, errs.At(err, node.Pos, procedureName(node.Procedure()), true)
+	}
+	return partialApply(node, fn, input, env)
+}
+
+// evalPartialProc evaluates the function a partial application applies.
+func evalPartialProc(node *parser.Node, input any, env *Environment) (any, error) {
 	fn, err := Eval(node.Procedure(), input, env)
 	if err != nil {
 		return nil, err
@@ -527,7 +591,11 @@ func evalPartial(node *parser.Node, input any, env *Environment) (any, error) {
 	if !IsFunction(fn) {
 		return nil, &JSONataError{Code: "T1008", Message: fmt.Sprintf("cannot partially apply a non-function: %T", fn)}
 	}
+	return fn, nil
+}
 
+// partialApply returns the partial application node of fn.
+func partialApply(node *parser.Node, fn, input any, env *Environment) (any, error) {
 	boundArgs := make([]any, len(node.Arguments()))
 	isPlaceholder := make([]bool, len(node.Arguments()))
 	placeholders := 0
@@ -576,7 +644,7 @@ func evalPartial(node *parser.Node, input any, env *Environment) (any, error) {
 			if !keepsFocus {
 				focus = nil
 			}
-			return invokeFunction(fn, fullArgs, 0, focus, env, false)
+			return invokeFunction(fn, fullArgs, 0, focus, env, false, callSite{})
 		},
 		Arity:        placeholders,
 		CallsLambdas: isLambda(fn),
@@ -719,7 +787,10 @@ func evalLambdaBody(f *Lambda, args []any, plain plainArgs, focus any, env *Envi
 	result, err := evalBody(f, childEnv, counter)
 	if tc, isTail := result.(*TailCall); isTail && err == nil {
 		if _, isLambda := tc.Fn.(*Lambda); !isLambda {
-			result, err := callFunction(tc.Fn, tc.Args, tc.Focus, env)
+			result, err := invokeFunction(tc.Fn, tc.Args, 0, tc.Focus, env, true, tc.Site)
+			if err != nil && tc.Site.pos != 0 {
+				return nil, &tailCallError{err: err}
+			}
 			if seq, ok := result.(*Sequence); ok && seq.ArgShaped && tc.Plain.has(0) {
 				return slices.Clip(seq.Values), err
 			}
@@ -796,13 +867,38 @@ func callWrapper(f *SignedBuiltin, args []any, focus any, env *Environment, coun
 // context, which fills a missing context argument before the arguments are
 // validated.
 func callFunction(fn any, args []any, focus any, env *Environment) (any, error) {
-	return invokeFunction(fn, args, 0, focus, env, true)
+	return invokeFunction(fn, args, 0, focus, env, true, callSite{})
 }
 
 // invokeFunction is callFunction, checking the first call's arguments only
 // when checked is set, with plain marking the arguments that are plain
-// arrays. Tail calls are always checked.
-func invokeFunction(fn any, args []any, plain plainArgs, focus any, env *Environment, checked bool) (any, error) {
+// arrays. Tail calls are always checked. An error is reported at site, or at
+// the site of the jsonata-js tail call that raised it.
+func invokeFunction(fn any, args []any, plain plainArgs, focus any, env *Environment, checked bool, site callSite) (any, error) {
+	result, err := applyFunction(fn, args, plain, focus, env, checked, &site)
+	if err != nil {
+		var tail *tailCallError
+		if errors.As(err, &tail) {
+			return nil, tail.err
+		}
+		return nil, site.at(err)
+	}
+	return result, nil
+}
+
+// tailCallError is an error raised by a built-in a jsonata-js tail call
+// applied, already at its site, which the lambda making the call passes on
+// as it is: jsonata-js applies the call from its trampoline, after the
+// lambda has returned.
+type tailCallError struct{ err error }
+
+func (e *tailCallError) Error() string { return e.err.Error() }
+
+// applyFunction is invokeFunction, moving site to each jsonata-js tail
+// call it trampolines.
+func applyFunction(
+	fn any, args []any, plain plainArgs, focus any, env *Environment, checked bool, site *callSite,
+) (any, error) {
 	counter := env.callCounter()
 
 	// Trampoline loop: if the body returns a TailCall, re-invoke without
@@ -862,6 +958,9 @@ func invokeFunction(fn any, args []any, plain plainArgs, focus any, env *Environ
 					return nil, &JSONataError{Code: "U1001", Message: fmt.Sprintf("stack overflow error: evaluation exceeded stack depth %d", counter.max)}
 				}
 				fn, args, plain, focus = tc.Fn, tc.Args, tc.Plain, tc.Focus
+				if tc.Site.pos != 0 {
+					*site = tc.Site
+				}
 				continue
 			}
 			return result, nil

@@ -1,13 +1,30 @@
 package evaluator
 
 import (
+	"errors"
 	"fmt"
 	"iter"
 
+	"github.com/recolabs/gnata/internal/errs"
 	"github.com/recolabs/gnata/internal/parser"
 )
 
 func evalGroupBy(node *parser.Node, input any, env *Environment) (any, error) {
+	result, err := evalGroupByNode(node, input, env)
+	return result, keyErrorAt(err, node.Group().Pos)
+}
+
+// keyErrorAt places an error about the keys of an object constructor or
+// group, T1003 or D1009, at pos, its {, unless a nested one placed it.
+func keyErrorAt(err error, pos int) error {
+	var e *JSONataError
+	if errors.As(err, &e) && e.Position == 0 && (e.Code == "T1003" || e.Code == "D1009") {
+		return errs.At(err, pos, "", false)
+	}
+	return err
+}
+
+func evalGroupByNode(node *parser.Node, input any, env *Environment) (any, error) {
 	// A path with #$var, @$var or ancestor bindings runs as a tuple stream,
 	// whose evalPathTuple applies the group with per-tuple environments.
 	if node.Type == parser.NodePath && pathHasTupleStep(node.Steps()) {

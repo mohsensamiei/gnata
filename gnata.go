@@ -18,10 +18,19 @@ import (
 
 	"github.com/recolabs/gnata/functions"
 	"github.com/recolabs/gnata/internal/decimal"
+	"github.com/recolabs/gnata/internal/errs"
 	"github.com/recolabs/gnata/internal/evaluator"
 	"github.com/recolabs/gnata/internal/parser"
 	"github.com/tidwall/gjson"
 )
+
+// Error is the structured error Compile and the Eval methods return for a
+// JSONata error: errors.As(err, &e) with e of type *Error gives its Code,
+// Token, Value and Position. Position is a character index into the
+// expression in UTF-16 code units, the position jsonata-js 2.2 reports, so
+// it can be used directly against a JavaScript string; 0 means none (or the
+// very start of the expression).
+type Error = evaluator.JSONataError
 
 // Expression is a compiled, reusable, goroutine-safe JSONata expression.
 type Expression struct {
@@ -286,7 +295,7 @@ func (e *Expression) evalCore(ctx context.Context, data any, parent *evaluator.E
 		if env.DeadlineExceeded() {
 			return nil, &evaluator.JSONataError{Code: "D1012", Message: fmt.Sprintf("Evaluation timeout after %s", e.options.timeout)}
 		}
-		return nil, err
+		return nil, errs.InUTF16(e.src, err)
 	}
 	if seq, ok := result.(*evaluator.Sequence); ok {
 		result = evaluator.CollapseSequence(seq)

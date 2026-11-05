@@ -4,6 +4,7 @@ import (
 	"slices"
 	"sync/atomic"
 
+	"github.com/recolabs/gnata/internal/errs"
 	"github.com/recolabs/gnata/internal/parser"
 )
 
@@ -421,7 +422,7 @@ func validateTransformClauses(node *parser.Node, target any, env *Environment) e
 		if updateVal, err := Eval(node.Update(), target, env); err != nil {
 			return err
 		} else if updateVal != nil && !IsNull(updateVal) && !IsMap(updateVal) {
-			return &errTransformUpdate
+			return errs.At(&errTransformUpdate, nodePosition(node.Update()), "", false)
 		}
 	}
 	if node.Delete() != nil {
@@ -437,7 +438,7 @@ func (c *transformClone) applyTarget(node *parser.Node, target *OrderedMap) erro
 			return err
 		} else if updateVal != nil && !IsNull(updateVal) {
 			if !IsMap(updateVal) {
-				return &errTransformUpdate
+				return errs.At(&errTransformUpdate, nodePosition(node.Update()), "", false)
 			}
 			if updateVal, err = c.detach(updateVal, target); err != nil {
 				return err
@@ -475,15 +476,24 @@ func deleteKeys(node *parser.Node, target any, env *Environment) ([]string, erro
 	}
 	items, isArr := AsArray(deleteVal)
 	if !isArr {
-		return nil, &errTransformDelete
+		return nil, errs.At(&errTransformDelete, nodePosition(node.Delete()), "", false)
 	}
 	keys := make([]string, len(items))
 	for i, item := range items {
 		s, ok := item.(string)
 		if !ok {
-			return nil, &errTransformDelete
+			return nil, errs.At(&errTransformDelete, nodePosition(node.Delete()), "", false)
 		}
 		keys[i] = s
 	}
 	return keys, nil
+}
+
+// nodePosition is the position jsonata-js gives the processed node n: none
+// for a path, which it builds anew.
+func nodePosition(n *parser.Node) int {
+	if n.Type == parser.NodePath {
+		return 0
+	}
+	return n.Pos
 }
