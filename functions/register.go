@@ -26,7 +26,6 @@ var builtinFuncs = []struct {
 	{"trim", fnTrim},
 	{"pad", fnPad},
 	{"contains", fnContains},
-	{"split", fnSplit},
 	{"join", fnJoin},
 	{"base64encode", fnBase64Encode},
 	{"base64decode", fnBase64Decode},
@@ -180,6 +179,7 @@ func newBuiltin(name string, fn evaluator.EnvAwareBuiltin) *evaluator.SignedBuil
 	if err != nil {
 		panic(fmt.Sprintf("$%s: %v", name, err))
 	}
+	sb.Cost = costs[name]
 	return sb
 }
 
@@ -212,6 +212,7 @@ func RegisterAll(env *evaluator.Environment, evalFn EvalFn) {
 	bind(env, "lookup", fnLookup)
 	bind(env, "keys", fnKeys)
 	bind(env, "spread", fnSpread)
+	bind(env, "split", fnSplit)
 	bind(env, "flatten", fnFlatten)
 	bindPlain(env, "uppercase", fnUppercase)
 	bindPlain(env, "lowercase", fnLowercase)

@@ -12,4 +12,5 @@ type TailCall struct {
 	Args  []any
 	Focus any       // the call's context: the entering call's for a jsonata-js tail call
 	Plain plainArgs // the arguments that are plain arrays
+	Site  callSite  // where its errors are reported: zero for a call jsonata-js does not trampoline
 }

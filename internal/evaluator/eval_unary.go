@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/recolabs/gnata/internal/decimal"
+	"github.com/recolabs/gnata/internal/errs"
 	"github.com/recolabs/gnata/internal/parser"
 )
 
@@ -24,10 +25,10 @@ func evalUnary(node *parser.Node, input any, env *Environment) (any, error) {
 		}
 		f, ok := ToFloat64(val)
 		if !ok {
-			return nil, &JSONataError{
+			return nil, errs.At(&JSONataError{
 				Code:    "D1002",
 				Message: fmt.Sprintf("the operand of the unary - operator must evaluate to a number, got %T", val),
-			}
+			}, node.Pos, "-", true)
 		}
 		return -f, nil
 
@@ -52,6 +53,14 @@ func evalUnary(node *parser.Node, input any, env *Environment) (any, error) {
 				if err := env.CheckSequence(len(result) + appendLength(val)); err != nil {
 					return nil, err
 				}
+			}
+			// The first items appended are allocated at their size at once.
+			perItem := int64(ElementBytes)
+			if len(result) == 0 {
+				perItem = SlotBytes
+			}
+			if err := env.Charge(constructedItems(val, isExplicitArray) * perItem); err != nil {
+				return nil, err
 			}
 			switch v := val.(type) {
 			case *Sequence:
@@ -85,6 +94,11 @@ func evalUnary(node *parser.Node, input any, env *Environment) (any, error) {
 }
 
 func evalObjectConstructor(node *parser.Node, input any, env *Environment) (any, error) {
+	result, err := constructObject(node, input, env)
+	return result, keyErrorAt(err, node.Pos)
+}
+
+func constructObject(node *parser.Node, input any, env *Environment) (any, error) {
 	// As jsonata-js evaluateGroupExpression, an object constructor over an
 	// array groups its items, unless the array is the root input jsonata-js
 	// wraps as one item, which its pairs then see unwrapped.
@@ -96,6 +110,9 @@ func evalObjectConstructor(node *parser.Node, input any, env *Environment) (any,
 			return groupItems(objectPairs(node.LHS()), items, env)
 		}
 		env = unwrapRoot(env)
+	}
+	if err := env.Charge(ObjectBytes); err != nil {
+		return nil, err
 	}
 	result := NewOrderedMap()
 	for i := 0; i+1 < len(node.LHS()); i += 2 {
@@ -126,6 +143,9 @@ func evalObjectConstructor(node *parser.Node, input any, env *Environment) (any,
 		if val == nil {
 			continue
 		}
+		if err := env.Charge(EntryBytes + int64(len(key))); err != nil {
+			return nil, err
+		}
 		result.Set(key, val)
 	}
 	return result, nil
@@ -139,4 +159,19 @@ func isArrayConstructor(n *parser.Node) bool {
 		n = n.Left
 	}
 	return n.Type == parser.NodeUnary && n.Value == "["
+}
+
+// constructedItems is how many items an array constructor appends for val,
+// the value of one of its expressions.
+func constructedItems(val any, explicit bool) int64 {
+	if seq, ok := val.(*Sequence); ok && !seq.ConsArray && !explicit {
+		return int64(len(seq.Values))
+	}
+	if _, ok := val.(*Sequence); ok || explicit {
+		return 1
+	}
+	if arr, ok := AsArray(val); ok {
+		return int64(len(arr))
+	}
+	return 1
 }

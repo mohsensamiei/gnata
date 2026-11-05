@@ -270,7 +270,8 @@ func evalConsArrayStep(step *parser.Node, input any, env *Environment, keepSingl
 // context item, grouping its elements by key like ${...} does.
 func consArrayGroup(step *parser.Node, input any, env *Environment) (any, error) {
 	items, _ := AsArray(input)
-	return groupItems(objectPairs(step.LHS()), items, env)
+	result, err := groupItems(objectPairs(step.LHS()), items, env)
+	return result, keyErrorAt(err, step.Pos)
 }
 
 // evalPathTuple evaluates a path that binds #$var, @$var or an ancestor by
@@ -600,7 +601,7 @@ func evalTupleSort(
 			aVal, aEnv = termContext(a)
 			bVal, bEnv = termContext(b)
 		}
-		return compareSortTerms(step.Terms(), aVal, bVal, aEnv, bEnv)
+		return compareSortTerms(step.Terms(), aVal, bVal, aEnv, bEnv, step.Pos)
 	}); err != nil {
 		return nil, false, false, err
 	}

@@ -4,6 +4,7 @@ import (
 	"slices"
 	"sort"
 
+	"github.com/recolabs/gnata/internal/errs"
 	"github.com/recolabs/gnata/internal/parser"
 )
 
@@ -65,7 +66,7 @@ func evalSort(node *parser.Node, input any, env *Environment) (any, error) {
 		if err := env.Err(); err != nil {
 			return 0, err
 		}
-		return compareSortTerms(node.Terms(), a, b, env, env)
+		return compareSortTerms(node.Terms(), a, b, env, env, node.Pos)
 	}); err != nil {
 		return nil, err
 	}
@@ -168,8 +169,9 @@ func SortItemsErr[T any](items []T, cmp func(a, b T) (int, error)) error {
 
 // compareSortTerms evaluates sort terms against two values and returns the
 // comparison result. Each value may have its own environment (for parent-tracking
-// sorts where each item carries its lexical scope).
-func compareSortTerms(terms []parser.SortTerm, aVal, bVal any, aEnv, bEnv *Environment) (int, error) {
+// sorts where each item carries its lexical scope). An error comparing them
+// is placed at pos, the sort's ^, as in jsonata-js.
+func compareSortTerms(terms []parser.SortTerm, aVal, bVal any, aEnv, bEnv *Environment, pos int) (int, error) {
 	for _, term := range terms {
 		av, err := Eval(term.Expression, aVal, aEnv)
 		if err != nil {
@@ -180,7 +182,7 @@ func compareSortTerms(terms []parser.SortTerm, aVal, bVal any, aEnv, bEnv *Envir
 			return 0, err
 		}
 		if cmp, err := compareOrder(av, bv, aEnv.DecimalPrecision()); err != nil {
-			return 0, err
+			return 0, errs.At(err, pos, "", false)
 		} else if cmp != 0 {
 			if term.Descending {
 				return -cmp, nil

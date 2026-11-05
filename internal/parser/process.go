@@ -1,6 +1,11 @@
 package parser
 
-import "slices"
+import (
+	"fmt"
+	"slices"
+
+	"github.com/recolabs/gnata/internal/errs"
+)
 
 // ProcessAST runs the post-processing pass over the raw Pratt-parsed tree,
 // transforming it into a form suitable for evaluation.
@@ -102,7 +107,8 @@ func takePathGroup(node *Node) *GroupExpr {
 }
 
 // joinGroups returns the one group of a and b, raising S0210 if both are
-// set: a path or step has at most one group.
+// set: a path or step has at most one group. As in jsonata-js, the error is
+// at the later group.
 func joinGroups(a, b *GroupExpr) (*GroupExpr, error) {
 	switch {
 	case a == nil:
@@ -110,7 +116,7 @@ func joinGroups(a, b *GroupExpr) (*GroupExpr, error) {
 	case b == nil:
 		return a, nil
 	}
-	return nil, parseError("S0210", "{", "each step can only have one grouping expression")
+	return nil, syntaxError("S0210", "", "{", max(a.Pos, b.Pos), "each step can only have one grouping expression")
 }
 
 // processDotBinary flattens a binary(".") node into a path node.
@@ -122,7 +128,10 @@ func processDotBinary(node *Node) (*Node, error) {
 	}
 	for _, step := range steps {
 		if base := StepBase(step); base.Type == NodeNumber || base.Type == NodeValue {
-			return nil, parseError("S0213", base.Value, "a number, true, false or null cannot be a path step")
+			err := errs.Syntax("S0213", "", base.Pos, "a number, true, false or null cannot be a path step",
+				fmt.Sprintf("JSONata error S0213 at token %q: a number, true, false or null cannot be a path step", base.Value))
+			err.Value = literalValue(base)
+			return nil, err
 		}
 	}
 
@@ -199,7 +208,7 @@ func collectPathSteps(node *Node, steps []*Node) ([]*Node, *GroupExpr, error) {
 	}
 	if node.Focus() != "" {
 		if last.Type == NodeBinary && last.Value == "[" {
-			return nil, nil, parseError("S0215", "@", "the @ operator cannot follow a predicate expression")
+			return nil, nil, syntaxError("S0215", "", "@", node.Pos, "the @ operator cannot follow a predicate expression")
 		}
 		last.SetFocus(node.Focus())
 	}
@@ -528,7 +537,18 @@ func processPathChildren(node *Node) (*Node, error) {
 
 // ParseAndProcess parses src and runs the post-parse passes, returning the
 // tree the evaluator runs.
+//
+// A syntax error is an *errs.Error whose Position is the UTF-16 index into
+// src that jsonata-js reports.
 func ParseAndProcess(src string) (*Node, error) {
+	ast, err := parseAndProcess(src)
+	if err != nil {
+		return nil, errs.InUTF16(src, err)
+	}
+	return ast, nil
+}
+
+func parseAndProcess(src string) (*Node, error) {
 	p := NewParser(src)
 	ast, err := p.Parse()
 	if err != nil {
@@ -718,4 +738,17 @@ func hasBinding(node *Node) bool {
 		return false
 	}
 	return hasBinding(node.Left) || hasBinding(node.Right) || slices.ContainsFunc(node.Steps(), hasBinding)
+}
+
+// literalValue is the value of a number, true, false or null node.
+func literalValue(n *Node) any {
+	switch {
+	case n.Type == NodeNumber:
+		return n.NumVal()
+	case n.Value == "true":
+		return true
+	case n.Value == "false":
+		return false
+	}
+	return nil
 }

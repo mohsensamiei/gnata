@@ -3,20 +3,22 @@ package evaluator
 import (
 	"fmt"
 
+	"github.com/recolabs/gnata/internal/errs"
 	"github.com/recolabs/gnata/internal/parser"
 )
 
 // evalChain applies right to piped, whose shape (see argShape) is
 // pipedShape, returning the result and its shape.
-func evalChain(right *parser.Node, piped any, pipedShape argShape, input any, env *Environment) (any, argShape, error) {
+// pos is the byte offset of the ~> applying right.
+func evalChain(right *parser.Node, piped any, pipedShape argShape, input any, env *Environment, pos int) (any, argShape, error) {
 	// Handle right-associative chaining: a ~> (f ~> g) → (a ~> f) ~> g
 	if right.Type == parser.NodeBinary && right.Value == "~>" {
-		if r1, shape, err := evalChain(right.Left, piped, pipedShape, input, env); err != nil {
+		if r1, shape, err := evalChain(right.Left, piped, pipedShape, input, env, pos); err != nil {
 			return nil, argShape{}, err
 		} else if r1 == nil {
 			return nil, argShape{}, nil
 		} else {
-			return evalChain(right.Right, r1, shape, input, env)
+			return evalChain(right.Right, r1, shape, input, env, right.Pos)
 		}
 	}
 	if right.Type == parser.NodeFunction && right.Procedure() != nil {
@@ -43,7 +45,7 @@ func evalChain(right *parser.Node, piped any, pipedShape argShape, input any, en
 				args[i+1] = wrapFunctionArg(arg, env)
 			}
 		}
-		return callShaped(fn, args, pipedShape, input, env, right.KeepArray())
+		return callShaped(fn, args, pipedShape, input, env, right.KeepArray(), callSiteOf(right))
 	}
 	// Right is a function reference or other expression.
 	fn, err := Eval(right, input, env)
@@ -54,10 +56,10 @@ func evalChain(right *parser.Node, piped any, pipedShape argShape, input any, en
 		return nil, argShape{}, &JSONataError{Code: "T1006", Message: "attempted to invoke undefined function"}
 	}
 	if !IsFunction(fn) {
-		return nil, argShape{}, &JSONataError{
+		return nil, argShape{}, errs.At(&JSONataError{
 			Code:    "T2006",
 			Message: fmt.Sprintf("the right-hand side of the ~> operator must be a function, got %T", fn),
-		}
+		}, pos, "", false)
 	}
 	// If piped value is itself a function, create a function composition rather
 	// than calling fn(piped). e.g. $trim ~> $uppercase creates a composed function.
@@ -86,10 +88,13 @@ func evalChain(right *parser.Node, piped any, pipedShape argShape, input any, en
 		}, argShape{}, nil
 	}
 	// jsonata-js applies a bare function reference with a null context.
-	return callShaped(fn, []any{piped}, pipedShape, Null, env, false)
+	return callShaped(fn, []any{piped}, pipedShape, Null, env, false, callSite{})
 }
 
 func evalBlock(node *parser.Node, input any, env *Environment) (any, error) {
+	if err := env.Charge(ScopeBytes); err != nil {
+		return nil, err
+	}
 	childEnv := NewChildEnvironment(env)
 	var last any
 	for _, expr := range node.Expressions() {

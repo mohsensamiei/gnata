@@ -1,13 +1,30 @@
 package evaluator
 
 import (
+	"errors"
 	"fmt"
 	"iter"
 
+	"github.com/recolabs/gnata/internal/errs"
 	"github.com/recolabs/gnata/internal/parser"
 )
 
 func evalGroupBy(node *parser.Node, input any, env *Environment) (any, error) {
+	result, err := evalGroupByNode(node, input, env)
+	return result, keyErrorAt(err, node.Group().Pos)
+}
+
+// keyErrorAt places an error about the keys of an object constructor or
+// group, T1003 or D1009, at pos, its {, unless a nested one placed it.
+func keyErrorAt(err error, pos int) error {
+	var e *JSONataError
+	if errors.As(err, &e) && e.Position == 0 && (e.Code == "T1003" || e.Code == "D1009") {
+		return errs.At(err, pos, "", false)
+	}
+	return err
+}
+
+func evalGroupByNode(node *parser.Node, input any, env *Environment) (any, error) {
 	// A path with #$var, @$var or ancestor bindings runs as a tuple stream,
 	// whose evalPathTuple applies the group with per-tuple environments.
 	if node.Type == parser.NodePath && pathHasTupleStep(node.Steps()) {
@@ -171,6 +188,10 @@ func groupBy(pairs iter.Seq2[*parser.Node, *parser.Node], items []any, envs []*E
 			}
 			entry := byKey[key]
 			if entry == nil {
+				// The entry, its place in byKey and in the result.
+				if err := env.Charge(3*EntryBytes + int64(len(key))); err != nil {
+					return nil, err
+				}
 				entry = &groupEntry{key: key, pair: index, value: valNode}
 				byKey[key] = entry
 				order = append(order, entry)
@@ -178,6 +199,9 @@ func groupBy(pairs iter.Seq2[*parser.Node, *parser.Node], items []any, envs []*E
 				return nil, &JSONataError{Code: "D1009", Message: fmt.Sprintf("duplicate key: %q", key)}
 			}
 			if err := entry.size.add(item, itemEnv); err != nil {
+				return nil, err
+			}
+			if err := env.Charge(ElementBytes); err != nil {
 				return nil, err
 			}
 			entry.items = append(entry.items, item)

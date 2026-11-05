@@ -68,4 +68,7 @@ type Token struct {
 	RegexPat string  // populated when Type==TokenRegex
 	RegexFlg string  // populated when Type==TokenRegex (flags; 'g' always appended)
 	Pos      int     // byte offset in source
+	// End is the byte offset just past the token, where jsonata-js places a
+	// token's position.
+	End int
 }

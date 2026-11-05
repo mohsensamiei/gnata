@@ -2,9 +2,11 @@ package parser
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 
+	"github.com/recolabs/gnata/internal/errs"
 	"github.com/recolabs/gnata/internal/lexer"
 )
 
@@ -49,8 +51,57 @@ func bindingPower(tt lexer.TokenType) int {
 	}
 }
 
-func parseError(code, tok, msg string) error {
-	return fmt.Errorf("JSONata error %s at token %q: %s", code, tok, msg)
+// parseError returns syntax error code about token tok, at byte offset pos
+// just past the token or node jsonata-js reports it at.
+func parseError(code, tok string, pos int, msg string) error {
+	return syntaxError(code, tok, tok, pos, msg)
+}
+
+// syntaxError is parseError for an error whose jsonata-js token, jsTok,
+// differs from the token tok its message has always named.
+func syntaxError(code, jsTok, tok string, pos int, msg string) error {
+	return errs.Syntax(code, jsTok, pos, msg, fmt.Sprintf("JSONata error %s at token %q: %s", code, tok, msg))
+}
+
+// jsPos is the position jsonata-js gives the parsed node n. Its dots nest
+// to the left, so a.b.c is at its last dot; here they nest to the right.
+func jsPos(n *Node) int {
+	for n.Type == NodeBinary && n.Value == "." && n.Right != nil && n.Right.Type == NodeBinary && n.Right.Value == "." {
+		n = n.Right
+	}
+	return n.Pos
+}
+
+// tokenText is a token's value as jsonata-js reports it in an error: the
+// name of a name or variable, a string's content, and a number, regex or
+// value literal as JavaScript converts it to a string. The null literal is
+// not reported.
+func tokenText(tok *lexer.Token) string {
+	switch tok.Type { //nolint:exhaustive // other tokens report their value
+	case lexer.TokenEOF:
+		return "(end)"
+	case lexer.TokenNumber:
+		return jsNumberString(tok.NumVal)
+	case lexer.TokenRegex:
+		return "/" + tok.RegexPat + "/" + tok.RegexFlg
+	case lexer.TokenValue:
+		if tok.IsNull {
+			return ""
+		}
+	}
+	return tok.Value
+}
+
+// jsNumberString formats f as JavaScript's String(f) does.
+func jsNumberString(f float64) string {
+	if a := math.Abs(f); a == 0 || a >= 1e-7 && a < 1e21 {
+		return strconv.FormatFloat(f, 'f', -1, 64)
+	}
+	s := strconv.FormatFloat(f, 'e', -1, 64)
+	mant, exp, _ := strings.Cut(s, "e")
+	sign := exp[:1]
+	exp = strings.TrimLeft(exp[1:], "0")
+	return mant + "e" + sign + exp
 }
 
 // MaxDepth is the deepest expression nesting the parser accepts. Each nested
@@ -118,7 +169,7 @@ func (p *Parser) next(infix bool) error {
 	// jsonata-js lexes a lone ! or ~ as an operator it has no symbol for,
 	// and rejects it as soon as it is read.
 	if tok.Type == lexer.TokenBang || tok.Type == lexer.TokenTilde {
-		return parseError("S0204", tok.Value, "unknown operator")
+		return parseError("S0204", tok.Value, tok.End, "unknown operator")
 	}
 	p.token = tok
 	return nil
@@ -129,8 +180,7 @@ func (p *Parser) expect(tt lexer.TokenType) error {
 		return p.endError()
 	}
 	if p.token.Type != tt {
-		return parseError("S0202",
-			p.token.Value,
+		return syntaxError("S0202", tokenText(&p.token), p.token.Value, p.token.End,
 			fmt.Sprintf("expected token %d, got %d (%q)", tt, p.token.Type, p.token.Value))
 	}
 	return nil
@@ -164,7 +214,7 @@ func (p *Parser) Parse() (*Node, error) {
 		return nil, err
 	}
 	if p.token.Type != lexer.TokenEOF {
-		return nil, parseError("S0201", p.token.Value, "unexpected token")
+		return nil, syntaxError("S0201", tokenText(&p.token), p.token.Value, p.token.End, "unexpected token")
 	}
 	if p.deferred != nil {
 		return nil, p.deferred
@@ -174,7 +224,7 @@ func (p *Parser) Parse() (*Node, error) {
 
 // endError reports a token that was required where the expression ended.
 func (p *Parser) endError() error {
-	return parseError("S0203", "EOF", "expected a token before end of expression")
+	return syntaxError("S0203", "(end)", "EOF", len(p.src), "expected a token before end of expression")
 }
 
 // deferError records err to report once the expression has parsed; the first
@@ -220,7 +270,7 @@ func (p *Parser) expression(bp int) (*Node, error) {
 }
 
 func (p *Parser) depthError() error {
-	return parseError("S0218", p.token.Value,
+	return parseError("S0218", p.token.Value, p.token.End,
 		fmt.Sprintf("expression nesting exceeds the maximum depth of %d", MaxDepth))
 }
 
@@ -232,8 +282,8 @@ func (p *Parser) nud() (*Node, error) { //nolint:gocyclo,funlen // dispatch
 	case lexer.TokenEOF:
 		// An operand is missing, as in 1 +. Parsing continues so that a
 		// later expected token reports S0203 first, as in jsonata-js.
-		p.deferError(parseError("S0207", "EOF", "unexpected end of expression"))
-		return &Node{Type: NodeValue, Value: "null", Pos: tok.Pos}, nil
+		p.deferError(syntaxError("S0207", "(end)", "EOF", len(p.src), "unexpected end of expression"))
+		return &Node{Type: NodeValue, Value: "null", Pos: tok.End}, nil
 
 	case lexer.TokenName:
 		if err := p.advanceInfix(); err != nil {
@@ -241,40 +291,40 @@ func (p *Parser) nud() (*Node, error) { //nolint:gocyclo,funlen // dispatch
 		}
 		// Special case: lambda keyword — only when followed by '('.
 		if (tok.Value == "function" || tok.Value == "λ") && p.token.Type == lexer.TokenLParen {
-			return p.parseLambda(tok.Pos)
+			return p.parseLambda()
 		}
-		return &Node{Type: NodeName, Value: tok.Value, Pos: tok.Pos}, nil
+		return &Node{Type: NodeName, Value: tok.Value, Pos: tok.End}, nil
 
 	case lexer.TokenAnd, lexer.TokenOr, lexer.TokenIn:
 		// "and" / "or" / "in" can appear as field names in prefix position.
 		if err := p.advanceInfix(); err != nil {
 			return nil, err
 		}
-		return &Node{Type: NodeName, Value: tok.Value, Pos: tok.Pos}, nil
+		return &Node{Type: NodeName, Value: tok.Value, Pos: tok.End}, nil
 
 	case lexer.TokenVariable:
 		if err := p.advanceInfix(); err != nil {
 			return nil, err
 		}
-		return &Node{Type: NodeVariable, Value: tok.Value, Pos: tok.Pos}, nil
+		return &Node{Type: NodeVariable, Value: tok.Value, Pos: tok.End}, nil
 
 	case lexer.TokenString:
 		if err := p.advanceInfix(); err != nil {
 			return nil, err
 		}
-		return &Node{Type: NodeString, Value: tok.Value, Pos: tok.Pos}, nil
+		return &Node{Type: NodeString, Value: tok.Value, Pos: tok.End}, nil
 
 	case lexer.TokenNumber:
 		if err := p.advanceInfix(); err != nil {
 			return nil, err
 		}
-		return (&Node{Type: NodeNumber, Value: tok.Value, Pos: tok.Pos}).SetNumVal(tok.NumVal), nil
+		return (&Node{Type: NodeNumber, Value: tok.Value, Pos: tok.End}).SetNumVal(tok.NumVal), nil
 
 	case lexer.TokenValue:
 		if err := p.advanceInfix(); err != nil {
 			return nil, err
 		}
-		return &Node{Type: NodeValue, Value: tok.Value, Pos: tok.Pos}, nil
+		return &Node{Type: NodeValue, Value: tok.Value, Pos: tok.End}, nil
 
 	case lexer.TokenRegex:
 		if err := p.advanceInfix(); err != nil {
@@ -285,7 +335,7 @@ func (p *Parser) nud() (*Node, error) { //nolint:gocyclo,funlen // dispatch
 		if tok.RegexFlg != "" {
 			val = tok.RegexPat + "/" + tok.RegexFlg
 		}
-		return &Node{Type: NodeRegex, Value: val, Pos: tok.Pos}, nil
+		return &Node{Type: NodeRegex, Value: val, Pos: tok.End}, nil
 
 	case lexer.TokenMinus:
 		if err := p.advanceInfix(); err != nil {
@@ -305,19 +355,19 @@ func (p *Parser) nud() (*Node, error) { //nolint:gocyclo,funlen // dispatch
 			}
 			return sub, nil
 		}
-		return (&Node{Type: NodeUnary, Value: "-", Pos: tok.Pos}).SetExpression(sub), nil
+		return (&Node{Type: NodeUnary, Value: "-", Pos: tok.End}).SetExpression(sub), nil
 
 	case lexer.TokenStar:
 		if err := p.advanceInfix(); err != nil {
 			return nil, err
 		}
-		return &Node{Type: NodeWildcard, Value: "*", Pos: tok.Pos}, nil
+		return &Node{Type: NodeWildcard, Value: "*", Pos: tok.End}, nil
 
 	case lexer.TokenStarStar:
 		if err := p.advanceInfix(); err != nil {
 			return nil, err
 		}
-		return &Node{Type: NodeDescendant, Value: "**", Pos: tok.Pos}, nil
+		return &Node{Type: NodeDescendant, Value: "**", Pos: tok.End}, nil
 
 	case lexer.TokenPercent:
 		if err := p.advanceInfix(); err != nil {
@@ -325,11 +375,11 @@ func (p *Parser) nud() (*Node, error) { //nolint:gocyclo,funlen // dispatch
 		}
 		slot := &Slot{Label: "!" + strconv.Itoa(len(p.slots)), Level: 1}
 		p.slots = append(p.slots, slot)
-		return (&Node{Type: NodeParent, Value: "%", Pos: tok.Pos}).SetSlot(slot), nil
+		return (&Node{Type: NodeParent, Value: "%", Pos: tok.End}).SetSlot(slot), nil
 
 	case lexer.TokenLBracket:
 		// Array constructor.
-		pos := tok.Pos
+		pos := tok.End
 		if err := p.advanceInfix(); err != nil {
 			return nil, err
 		}
@@ -358,7 +408,7 @@ func (p *Parser) nud() (*Node, error) { //nolint:gocyclo,funlen // dispatch
 
 	case lexer.TokenLBrace:
 		// Object constructor.
-		pos := tok.Pos
+		pos := tok.End
 		if err := p.advanceInfix(); err != nil {
 			return nil, err
 		}
@@ -372,23 +422,25 @@ func (p *Parser) nud() (*Node, error) { //nolint:gocyclo,funlen // dispatch
 		return (&Node{Type: NodeUnary, Value: "{", Pos: pos}).SetLHS(pairs), nil
 
 	case lexer.TokenLParen:
-		return p.parseParenOrBlock(tok.Pos)
+		return p.parseParenOrBlock(tok.End)
 
 	case lexer.TokenPipe:
 		// Transform expression: |pattern| update delete? |
-		return p.parseTransform(tok.Pos)
+		return p.parseTransform(tok.End)
 
 	case lexer.TokenChain:
-		return nil, parseError("S0211", "~>", "invalid use of ~> as prefix")
+		return nil, parseError("S0211", "~>", tok.End, "invalid use of ~> as prefix")
 
 	default:
-		return nil, parseError("S0211", tok.Value, "invalid use of token as prefix")
+		return nil, syntaxError("S0211", tokenText(&tok), tok.Value, tok.End, "invalid use of token as prefix")
 	}
 }
 
 // parseLambda parses: function($p1, $p2, ...) { body }
-// Called after consuming the "function" or "λ" name token.
-func (p *Parser) parseLambda(pos int) (*Node, error) {
+// Called after consuming the "function" or "λ" name token. As in jsonata-js,
+// the lambda is at its (.
+func (p *Parser) parseLambda() (*Node, error) {
+	pos := p.token.End
 	if err := p.consume(lexer.TokenLParen); err != nil {
 		return nil, err
 	}
@@ -417,21 +469,30 @@ func (p *Parser) parseLambda(pos int) (*Node, error) {
 	if err := p.advanceInfix(); err != nil { // consume )
 		return nil, err
 	}
-	for _, param := range params {
+	for i, param := range params {
 		if param.Type != NodeVariable || param.Index() != "" || param.Focus() != "" || param.Group() != nil {
-			return nil, parseError("S0208", param.Value, "expected $parameter name in lambda")
+			err := errs.Syntax("S0208", param.Value, jsPos(param), "expected $parameter name in lambda",
+				fmt.Sprintf("JSONata error S0208 at token %q: expected $parameter name in lambda", param.Value))
+			err.Value = i + 1
+			return nil, err
 		}
 	}
 
 	// Optional signature: <sig>
 	var sig *Signature
 	if p.token.Type == lexer.TokenLT {
+		sigPos := p.token.End
 		sigStr, err := p.parseSignatureString()
 		if err != nil {
 			return nil, err
 		}
 		params, err := ParseSig(sigStr)
 		if err != nil {
+			// jsonata-js places a signature error at the < plus its offset
+			// in the signature, < included.
+			if e, ok := err.(*errs.Error); ok { //nolint:errorlint // ParseSig returns it unwrapped
+				e.Position += sigPos + 1
+			}
 			return nil, err
 		}
 		sig = &Signature{Params: params}
@@ -601,11 +662,11 @@ func (p *Parser) led(left *Node) (*Node, error) { //nolint:gocyclo,funlen // dis
 	switch tok.Type { //nolint:exhaustive // infix tokens only
 	case lexer.TokenLParen:
 		// Function call.
-		return p.parseFunctionCall(left, tok.Pos)
+		return p.parseFunctionCall(left, tok.End)
 
 	case lexer.TokenLBracket:
 		// Array index / predicate.
-		return p.parseSubscript(left, tok.Pos)
+		return p.parseSubscript(left, tok.End)
 
 	case lexer.TokenDot:
 		if err := p.advance(); err != nil {
@@ -615,10 +676,10 @@ func (p *Parser) led(left *Node) (*Node, error) { //nolint:gocyclo,funlen // dis
 		if err != nil {
 			return nil, err
 		}
-		return &Node{Type: NodeBinary, Value: ".", Left: left, Right: right, Pos: tok.Pos}, nil
+		return &Node{Type: NodeBinary, Value: ".", Left: left, Right: right, Pos: tok.End}, nil
 
 	case lexer.TokenAt, lexer.TokenHash:
-		return p.parseBinding(left, tok.Type == lexer.TokenAt)
+		return p.parseBinding(left, tok.Type == lexer.TokenAt, tok.End)
 
 	case lexer.TokenQuestion:
 		// Conditional (ternary) operator.
@@ -629,7 +690,7 @@ func (p *Parser) led(left *Node) (*Node, error) { //nolint:gocyclo,funlen // dis
 		if err != nil {
 			return nil, err
 		}
-		node := (&Node{Type: NodeCondition, Pos: tok.Pos}).SetCondition(left).SetThen(then)
+		node := (&Node{Type: NodeCondition, Pos: tok.End}).SetCondition(left).SetThen(then)
 		if p.token.Type == lexer.TokenColon {
 			if err := p.advance(); err != nil {
 				return nil, err
@@ -645,7 +706,7 @@ func (p *Parser) led(left *Node) (*Node, error) { //nolint:gocyclo,funlen // dis
 	case lexer.TokenAssign:
 		// S0212: left side must be a $variable.
 		if left.Type != NodeVariable {
-			return nil, parseError("S0212", tok.Value, "the left side of := must be a $variable name")
+			return nil, syntaxError("S0212", left.Value, tok.Value, jsPos(left), "the left side of := must be a $variable name")
 		}
 		if err := p.advance(); err != nil {
 			return nil, err
@@ -654,7 +715,7 @@ func (p *Parser) led(left *Node) (*Node, error) { //nolint:gocyclo,funlen // dis
 		if err != nil {
 			return nil, err
 		}
-		return &Node{Type: NodeBind, Left: left, Right: right, Pos: tok.Pos}, nil
+		return &Node{Type: NodeBind, Left: left, Right: right, Pos: tok.End}, nil
 
 	case lexer.TokenChain:
 		if err := p.advance(); err != nil {
@@ -664,7 +725,7 @@ func (p *Parser) led(left *Node) (*Node, error) { //nolint:gocyclo,funlen // dis
 		if err != nil {
 			return nil, err
 		}
-		return &Node{Type: NodeBinary, Value: "~>", Left: left, Right: right, Pos: tok.Pos}, nil
+		return &Node{Type: NodeBinary, Value: "~>", Left: left, Right: right, Pos: tok.End}, nil
 
 	case lexer.TokenElvis:
 		if err := p.advance(); err != nil {
@@ -674,7 +735,7 @@ func (p *Parser) led(left *Node) (*Node, error) { //nolint:gocyclo,funlen // dis
 		if err != nil {
 			return nil, err
 		}
-		return &Node{Type: NodeBinary, Value: "?:", Left: left, Right: right, Pos: tok.Pos}, nil
+		return &Node{Type: NodeBinary, Value: "?:", Left: left, Right: right, Pos: tok.End}, nil
 
 	case lexer.TokenCoalesce:
 		if err := p.advance(); err != nil {
@@ -684,7 +745,7 @@ func (p *Parser) led(left *Node) (*Node, error) { //nolint:gocyclo,funlen // dis
 		if err != nil {
 			return nil, err
 		}
-		return &Node{Type: NodeBinary, Value: "??", Left: left, Right: right, Pos: tok.Pos}, nil
+		return &Node{Type: NodeBinary, Value: "??", Left: left, Right: right, Pos: tok.End}, nil
 
 	case lexer.TokenDotDot:
 		if err := p.advance(); err != nil {
@@ -694,7 +755,7 @@ func (p *Parser) led(left *Node) (*Node, error) { //nolint:gocyclo,funlen // dis
 		if err != nil {
 			return nil, err
 		}
-		return &Node{Type: NodeBinary, Value: "..", Left: left, Right: right, Pos: tok.Pos}, nil
+		return &Node{Type: NodeBinary, Value: "..", Left: left, Right: right, Pos: tok.End}, nil
 
 	case lexer.TokenAnd:
 		if err := p.advance(); err != nil {
@@ -704,7 +765,7 @@ func (p *Parser) led(left *Node) (*Node, error) { //nolint:gocyclo,funlen // dis
 		if err != nil {
 			return nil, err
 		}
-		return &Node{Type: NodeBinary, Value: "and", Left: left, Right: right, Pos: tok.Pos}, nil
+		return &Node{Type: NodeBinary, Value: "and", Left: left, Right: right, Pos: tok.End}, nil
 
 	case lexer.TokenOr:
 		if err := p.advance(); err != nil {
@@ -714,7 +775,7 @@ func (p *Parser) led(left *Node) (*Node, error) { //nolint:gocyclo,funlen // dis
 		if err != nil {
 			return nil, err
 		}
-		return &Node{Type: NodeBinary, Value: "or", Left: left, Right: right, Pos: tok.Pos}, nil
+		return &Node{Type: NodeBinary, Value: "or", Left: left, Right: right, Pos: tok.End}, nil
 
 	case lexer.TokenIn:
 		if err := p.advance(); err != nil {
@@ -724,7 +785,7 @@ func (p *Parser) led(left *Node) (*Node, error) { //nolint:gocyclo,funlen // dis
 		if err != nil {
 			return nil, err
 		}
-		return &Node{Type: NodeBinary, Value: "in", Left: left, Right: right, Pos: tok.Pos}, nil
+		return &Node{Type: NodeBinary, Value: "in", Left: left, Right: right, Pos: tok.End}, nil
 
 	case lexer.TokenEquals:
 		if err := p.advance(); err != nil {
@@ -734,7 +795,7 @@ func (p *Parser) led(left *Node) (*Node, error) { //nolint:gocyclo,funlen // dis
 		if err != nil {
 			return nil, err
 		}
-		return &Node{Type: NodeBinary, Value: "=", Left: left, Right: right, Pos: tok.Pos}, nil
+		return &Node{Type: NodeBinary, Value: "=", Left: left, Right: right, Pos: tok.End}, nil
 
 	case lexer.TokenNE:
 		if err := p.advance(); err != nil {
@@ -744,7 +805,7 @@ func (p *Parser) led(left *Node) (*Node, error) { //nolint:gocyclo,funlen // dis
 		if err != nil {
 			return nil, err
 		}
-		return &Node{Type: NodeBinary, Value: "!=", Left: left, Right: right, Pos: tok.Pos}, nil
+		return &Node{Type: NodeBinary, Value: "!=", Left: left, Right: right, Pos: tok.End}, nil
 
 	case lexer.TokenLT:
 		if err := p.advance(); err != nil {
@@ -754,7 +815,7 @@ func (p *Parser) led(left *Node) (*Node, error) { //nolint:gocyclo,funlen // dis
 		if err != nil {
 			return nil, err
 		}
-		return &Node{Type: NodeBinary, Value: "<", Left: left, Right: right, Pos: tok.Pos}, nil
+		return &Node{Type: NodeBinary, Value: "<", Left: left, Right: right, Pos: tok.End}, nil
 
 	case lexer.TokenGT:
 		if err := p.advance(); err != nil {
@@ -764,7 +825,7 @@ func (p *Parser) led(left *Node) (*Node, error) { //nolint:gocyclo,funlen // dis
 		if err != nil {
 			return nil, err
 		}
-		return &Node{Type: NodeBinary, Value: ">", Left: left, Right: right, Pos: tok.Pos}, nil
+		return &Node{Type: NodeBinary, Value: ">", Left: left, Right: right, Pos: tok.End}, nil
 
 	case lexer.TokenLE:
 		if err := p.advance(); err != nil {
@@ -774,7 +835,7 @@ func (p *Parser) led(left *Node) (*Node, error) { //nolint:gocyclo,funlen // dis
 		if err != nil {
 			return nil, err
 		}
-		return &Node{Type: NodeBinary, Value: "<=", Left: left, Right: right, Pos: tok.Pos}, nil
+		return &Node{Type: NodeBinary, Value: "<=", Left: left, Right: right, Pos: tok.End}, nil
 
 	case lexer.TokenGE:
 		if err := p.advance(); err != nil {
@@ -784,7 +845,7 @@ func (p *Parser) led(left *Node) (*Node, error) { //nolint:gocyclo,funlen // dis
 		if err != nil {
 			return nil, err
 		}
-		return &Node{Type: NodeBinary, Value: ">=", Left: left, Right: right, Pos: tok.Pos}, nil
+		return &Node{Type: NodeBinary, Value: ">=", Left: left, Right: right, Pos: tok.End}, nil
 
 	case lexer.TokenPlus:
 		if err := p.advance(); err != nil {
@@ -794,7 +855,7 @@ func (p *Parser) led(left *Node) (*Node, error) { //nolint:gocyclo,funlen // dis
 		if err != nil {
 			return nil, err
 		}
-		return &Node{Type: NodeBinary, Value: "+", Left: left, Right: right, Pos: tok.Pos}, nil
+		return &Node{Type: NodeBinary, Value: "+", Left: left, Right: right, Pos: tok.End}, nil
 
 	case lexer.TokenMinus:
 		if err := p.advance(); err != nil {
@@ -804,7 +865,7 @@ func (p *Parser) led(left *Node) (*Node, error) { //nolint:gocyclo,funlen // dis
 		if err != nil {
 			return nil, err
 		}
-		return &Node{Type: NodeBinary, Value: "-", Left: left, Right: right, Pos: tok.Pos}, nil
+		return &Node{Type: NodeBinary, Value: "-", Left: left, Right: right, Pos: tok.End}, nil
 
 	case lexer.TokenStar:
 		if err := p.advance(); err != nil {
@@ -814,7 +875,7 @@ func (p *Parser) led(left *Node) (*Node, error) { //nolint:gocyclo,funlen // dis
 		if err != nil {
 			return nil, err
 		}
-		return &Node{Type: NodeBinary, Value: "*", Left: left, Right: right, Pos: tok.Pos}, nil
+		return &Node{Type: NodeBinary, Value: "*", Left: left, Right: right, Pos: tok.End}, nil
 
 	case lexer.TokenSlash:
 		if err := p.advance(); err != nil {
@@ -824,7 +885,7 @@ func (p *Parser) led(left *Node) (*Node, error) { //nolint:gocyclo,funlen // dis
 		if err != nil {
 			return nil, err
 		}
-		return &Node{Type: NodeBinary, Value: "/", Left: left, Right: right, Pos: tok.Pos}, nil
+		return &Node{Type: NodeBinary, Value: "/", Left: left, Right: right, Pos: tok.End}, nil
 
 	case lexer.TokenPercent:
 		if err := p.advance(); err != nil {
@@ -834,7 +895,7 @@ func (p *Parser) led(left *Node) (*Node, error) { //nolint:gocyclo,funlen // dis
 		if err != nil {
 			return nil, err
 		}
-		return &Node{Type: NodeBinary, Value: "%", Left: left, Right: right, Pos: tok.Pos}, nil
+		return &Node{Type: NodeBinary, Value: "%", Left: left, Right: right, Pos: tok.End}, nil
 
 	case lexer.TokenStarStar:
 		if err := p.advance(); err != nil {
@@ -844,7 +905,7 @@ func (p *Parser) led(left *Node) (*Node, error) { //nolint:gocyclo,funlen // dis
 		if err != nil {
 			return nil, err
 		}
-		return &Node{Type: NodeBinary, Value: "**", Left: left, Right: right, Pos: tok.Pos}, nil
+		return &Node{Type: NodeBinary, Value: "**", Left: left, Right: right, Pos: tok.End}, nil
 
 	case lexer.TokenAmp:
 		if err := p.advance(); err != nil {
@@ -854,14 +915,14 @@ func (p *Parser) led(left *Node) (*Node, error) { //nolint:gocyclo,funlen // dis
 		if err != nil {
 			return nil, err
 		}
-		return &Node{Type: NodeBinary, Value: "&", Left: left, Right: right, Pos: tok.Pos}, nil
+		return &Node{Type: NodeBinary, Value: "&", Left: left, Right: right, Pos: tok.End}, nil
 
 	case lexer.TokenLBrace:
 		// Group expression: attach key-value pairs to left.
-		pos := tok.Pos
+		pos := tok.End
 		// S0210: A step can only have one group-by expression.
 		if left.Group() != nil {
-			p.deferError(parseError("S0210", "{", "each step can only have one grouping expression"))
+			p.deferError(syntaxError("S0210", "", "{", pos, "each step can only have one grouping expression"))
 		}
 		if err := p.advance(); err != nil {
 			return nil, err
@@ -879,10 +940,10 @@ func (p *Parser) led(left *Node) (*Node, error) { //nolint:gocyclo,funlen // dis
 
 	case lexer.TokenCaret:
 		// Sort: ^(term, term, ...)
-		return p.parseSortExpr(left, tok.Pos)
+		return p.parseSortExpr(left, tok.End)
 
 	default:
-		return nil, parseError("S0201", tok.Value, "unexpected token in infix position")
+		return nil, syntaxError("S0201", tokenText(&tok), tok.Value, tok.End, "unexpected token in infix position")
 	}
 }
 
@@ -890,7 +951,7 @@ func (p *Parser) led(left *Node) (*Node, error) { //nolint:gocyclo,funlen // dis
 // jsonata-js, it parses the right side as an expression, binding as tightly as
 // a subscript, and then requires a plain $variable (S0214). It reports @ after
 // a predicate or sort (S0215, S0216) only once the whole expression has parsed.
-func (p *Parser) parseBinding(left *Node, focus bool) (*Node, error) {
+func (p *Parser) parseBinding(left *Node, focus bool, pos int) (*Node, error) {
 	op := "#"
 	if focus {
 		op = "@"
@@ -903,7 +964,7 @@ func (p *Parser) parseBinding(left *Node, focus bool) (*Node, error) {
 		return nil, err
 	}
 	if rhs.Type != NodeVariable {
-		return nil, parseError("S0214", op, "the right side of "+op+" must be a $variable")
+		return nil, parseError("S0214", op, jsPos(rhs), "the right side of "+op+" must be a $variable")
 	}
 	left.setIndexLast(!focus)
 	if !focus {
@@ -912,9 +973,9 @@ func (p *Parser) parseBinding(left *Node, focus bool) (*Node, error) {
 	}
 	switch {
 	case left.Type == NodeBinary && left.Value == "[":
-		p.deferError(parseError("S0215", "@", "the @ operator cannot follow a predicate expression"))
+		p.deferError(syntaxError("S0215", "", "@", pos, "the @ operator cannot follow a predicate expression"))
 	case left.Type == NodeSort:
-		p.deferError(parseError("S0216", "@", "the @ operator cannot follow a sort expression"))
+		p.deferError(syntaxError("S0216", "", "@", pos, "the @ operator cannot follow a sort expression"))
 	}
 	left.SetFocus(rhs.Value)
 	return left, nil
@@ -966,7 +1027,7 @@ func (p *Parser) parseArgument() (*Node, error) {
 	if p.token.Type != lexer.TokenQuestion {
 		return p.expression(0)
 	}
-	pos := p.token.Pos
+	pos := p.token.End
 	if err := p.advance(); err != nil {
 		return nil, err
 	}
@@ -1001,7 +1062,7 @@ func (p *Parser) parseSubscript(left *Node, pos int) (*Node, error) {
 	// on a path, as in a{k: v}[0], applies after all of it instead (see
 	// ProcessAST).
 	if left.Group() != nil && !left.Group().OnPath {
-		p.deferError(parseError("S0209", "[", "a predicate cannot follow a grouping expression in a step"))
+		p.deferError(syntaxError("S0209", "", "[", pos, "a predicate cannot follow a grouping expression in a step"))
 	}
 	expr, err := p.expression(0)
 	if err != nil {

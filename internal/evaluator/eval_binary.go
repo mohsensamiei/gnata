@@ -7,46 +7,37 @@ import (
 	"slices"
 
 	"github.com/recolabs/gnata/internal/decimal"
+	"github.com/recolabs/gnata/internal/errs"
 	"github.com/recolabs/gnata/internal/parser"
 )
 
-func evalBinary(node *parser.Node, input any, env *Environment) (any, error) { //nolint:gocyclo,funlen // dispatch
+func evalBinary(node *parser.Node, input any, env *Environment) (any, error) {
 	switch node.Value {
 	case "and":
 		left, err := Eval(node.Left, input, env)
 		if err != nil {
 			return nil, err
 		}
-		truthy, err := ToBooleanEnv(left, env)
+		// jsonata-js places any error after the left operand, the right
+		// operand's included, at the operator.
+		result, err := evalBoolRight(node, left, false, input, env)
 		if err != nil {
-			return nil, err
+			return nil, errs.At(err, node.Pos, node.Value, true)
 		}
-		if !truthy {
-			return false, nil
-		}
-		right, err := Eval(node.Right, input, env)
-		if err != nil {
-			return nil, err
-		}
-		return ToBooleanEnv(right, env)
+		return result, nil
 
 	case "or":
 		left, err := Eval(node.Left, input, env)
 		if err != nil {
 			return nil, err
 		}
-		truthy, err := ToBooleanEnv(left, env)
+		// jsonata-js places any error after the left operand, the right
+		// operand's included, at the operator.
+		result, err := evalBoolRight(node, left, true, input, env)
 		if err != nil {
-			return nil, err
+			return nil, errs.At(err, node.Pos, node.Value, true)
 		}
-		if truthy {
-			return true, nil
-		}
-		right, err := Eval(node.Right, input, env)
-		if err != nil {
-			return nil, err
-		}
-		return ToBooleanEnv(right, env)
+		return result, nil
 
 	case "?:":
 		// Elvis / default: return left if ToBoolean(left) is true, else right.
@@ -95,7 +86,34 @@ func evalBinary(node *parser.Node, input any, env *Environment) (any, error) { /
 	if err != nil {
 		return nil, err
 	}
+	result, err := applyBinary(node, left, right, env)
+	if err != nil {
+		// jsonata-js places an operator's own error at the operator.
+		return nil, errs.At(err, node.Pos, node.Value, true)
+	}
+	return result, nil
+}
 
+// evalBoolRight finishes and or once its left operand is known: short
+// is the result that the left operand alone decides, when it equals it.
+func evalBoolRight(node *parser.Node, left any, short bool, input any, env *Environment) (any, error) {
+	truthy, err := ToBooleanEnv(left, env)
+	if err != nil {
+		return nil, err
+	}
+	if truthy == short {
+		return short, nil
+	}
+	right, err := Eval(node.Right, input, env)
+	if err != nil {
+		return nil, err
+	}
+	return ToBooleanEnv(right, env)
+}
+
+// applyBinary applies the arithmetic, comparison, concatenation, in or range
+// operator of node to its evaluated operands.
+func applyBinary(node *parser.Node, left, right any, env *Environment) (any, error) {
 	switch node.Value {
 	case "+", "-", "*", "/", "%", "**":
 		op := node.Value
@@ -133,15 +151,7 @@ func evalBinary(node *parser.Node, input any, env *Environment) (any, error) { /
 		return evalArithFloat64(l, r, op)
 
 	case "&":
-		ls, err := stringifyValue(left, env)
-		if err != nil {
-			return nil, err
-		}
-		rs, err := stringifyValue(right, env)
-		if err != nil {
-			return nil, err
-		}
-		return ls + rs, nil
+		return concatStrings(left, right, env)
 
 	case "=", "!=":
 		if left == nil || right == nil {
@@ -170,6 +180,23 @@ func evalBinary(node *parser.Node, input any, env *Environment) (any, error) { /
 	default:
 		return nil, fmt.Errorf("unknown binary operator: %s", node.Value)
 	}
+}
+
+// concatStrings is the & operator: left and right as strings, joined,
+// charged against the memory budget before the result is allocated.
+func concatStrings(left, right any, env *Environment) (any, error) {
+	ls, err := stringifyValue(left, env)
+	if err != nil {
+		return nil, err
+	}
+	rs, err := stringifyValue(right, env)
+	if err != nil {
+		return nil, err
+	}
+	if err := env.Charge(int64(len(ls) + len(rs))); err != nil {
+		return nil, err
+	}
+	return ls + rs, nil
 }
 
 // evalDefaultLeft evaluates the left operand of ?: or ??, returning its

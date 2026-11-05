@@ -50,6 +50,9 @@ func evalRange(left, right any, env *Environment) (any, error) {
 		return nil, err
 	}
 	n := int(span) + 1
+	if err := env.Charge(int64(n) * SlotBytes); err != nil {
+		return nil, err
+	}
 	result := make([]any, n)
 	for i := range n {
 		if i%10000 == 0 {
@@ -103,6 +106,9 @@ func decimalRange(left, right any, env *Environment, prec int) (res any, ok bool
 		}
 	}
 	if err := checkRangeSpan(span, env); err != nil {
+		return nil, true, err
+	}
+	if err := env.Charge(int64(span+1) * SlotBytes); err != nil {
 		return nil, true, err
 	}
 	result := make([]any, int(span)+1)

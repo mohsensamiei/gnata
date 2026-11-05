@@ -40,9 +40,14 @@ func nameSharedLabels(slots []*Slot) {
 	}
 }
 
-// errNoParent is jsonata-js's S0217 for a % whose step cannot be derived.
+// errNoParent is jsonata-js's S0217 for a % whose step cannot be derived. A
+// path or a % has no position there, as jsonata-js builds them anew.
 func errNoParent(node *Node) error {
-	return parseError("S0217", node.Type.String(), "the object representing the 'parent' cannot be derived from this expression")
+	pos := node.Pos
+	if node.Type == NodePath || node.Type == NodeParent {
+		pos = 0
+	}
+	return parseError("S0217", node.Type.String(), pos, "the object representing the 'parent' cannot be derived from this expression")
 }
 
 // seekParent climbs slot through node, a step or a block's last expression.

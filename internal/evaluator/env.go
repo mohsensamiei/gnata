@@ -36,11 +36,12 @@ type callCounter struct {
 	// $now, $millis and $toMillis call in one evaluation sees the same instant.
 	nowMillis int64
 
-	// deadline is the WithTimeout guardrail, nil when unset so evaluations
-	// without a timeout pay one pointer. It is polled from Err rather than
-	// enforced with a context timer, so it needs no timer goroutine and still
-	// fires inside a synchronous call on single-threaded WebAssembly hosts.
-	deadline *deadlineState
+	// guard holds the WithTimeout and WithMemoryBudget guardrails, nil when
+	// neither is set so evaluations without them pay one pointer. The
+	// deadline is polled from Err rather than enforced with a context timer,
+	// so it needs no timer goroutine and still fires inside a synchronous
+	// call on single-threaded WebAssembly hosts.
+	guard *guardState
 	// ctx is the evaluation's context, shared by every environment using this
 	// counter (see SetContext).
 	ctx context.Context
@@ -93,10 +94,25 @@ func (c *callCounter) callNested(cost int, call func() (any, error)) (any, error
 	return result, err
 }
 
-type deadlineState struct {
-	at    time.Time
+// guardState is the state of an evaluation's WithTimeout deadline and
+// WithMemoryBudget budget.
+type guardState struct {
+	at    time.Time // the deadline; zero when there is none
 	ticks uint32
-	hit   bool
+	hit   bool // the deadline has passed
+
+	// memLimit is the memory budget in bytes, 0 when there is none, and
+	// memUsed the bytes charged against it so far (see Charge).
+	memLimit int64
+	memUsed  int64
+}
+
+// guardState returns the call counter's guardrail state, allocating it.
+func (c *callCounter) guardState() *guardState {
+	if c.guard == nil {
+		c.guard = &guardState{}
+	}
+	return c.guard
 }
 
 // deadlinePollMask spaces out time.Now calls: the deadline is checked on the
@@ -142,6 +158,10 @@ type Environment struct {
 	// done only to check it is skipped. It is set with the limit before
 	// evaluation starts, and children inherit it.
 	sequenceLimited bool
+	// memoryLimited mirrors whether the call counter has a WithMemoryBudget
+	// budget, so that without one Charge returns at once. It is set with the
+	// budget before evaluation starts, and children inherit it.
+	memoryLimited bool
 	// decimalPrecision is the significant digits set via WithDecimalPrecision
 	// (0 = float64 only), inherited by children. At most 100, so it fits in
 	// the padding after sequenceLimited.
@@ -171,6 +191,7 @@ func NewChildEnvironment(parent *Environment) *Environment {
 		env.done = parent.done
 		env.hasDeadline = parent.hasDeadline
 		env.sequenceLimited = parent.sequenceLimited
+		env.memoryLimited = parent.memoryLimited
 		env.decimalPrecision = parent.decimalPrecision
 	}
 	return env
@@ -441,8 +462,8 @@ func (e *Environment) deadlineErr(force bool) error {
 	if c == nil {
 		c = e.callCounter()
 	}
-	d := c.deadline
-	if d == nil {
+	d := c.guard
+	if d == nil || d.at.IsZero() {
 		return nil
 	}
 	if d.hit {
@@ -459,17 +480,70 @@ func (e *Environment) deadlineErr(force bool) error {
 // SetDeadline sets the evaluation deadline enforced by Err (zero = none).
 func (e *Environment) SetDeadline(t time.Time) {
 	c := e.callCounter()
-	c.deadline = nil
-	if !t.IsZero() {
-		c.deadline = &deadlineState{at: t}
+	if t.IsZero() && c.guard == nil {
+		e.hasDeadline = false
+		return
 	}
-	e.hasDeadline = c.deadline != nil
+	g := c.guardState()
+	g.at, g.ticks, g.hit = t, 0, false
+	e.hasDeadline = !t.IsZero()
 }
 
 // DeadlineExceeded reports whether Err has observed the deadline passing.
 func (e *Environment) DeadlineExceeded() bool {
-	d := e.callCounter().deadline
+	d := e.callCounter().guard
 	return d != nil && d.hit
+}
+
+// SetMemoryBudget sets the WithMemoryBudget budget of the evaluation, in
+// bytes (0 = none), for this environment and children created after it.
+func (e *Environment) SetMemoryBudget(n int64) {
+	c := e.callCounter()
+	e.memoryLimited = n > 0
+	if n <= 0 && c.guard == nil {
+		return
+	}
+	g := c.guardState()
+	g.memLimit, g.memUsed = max(n, 0), 0
+}
+
+// MemoryLimited reports whether the evaluation has a memory budget, so a
+// caller can skip work done only to compute what to charge.
+func (e *Environment) MemoryLimited() bool {
+	return e != nil && e.memoryLimited
+}
+
+// Charge spends n bytes of the evaluation's memory budget, before they are
+// allocated, and returns D1014 if that exceeds it. Every allocation of a
+// string, array or object that grows with the data is charged, and charges
+// are never returned, so the budget bounds the memory such values take over
+// the whole evaluation, garbage included. Without a budget Charge does
+// nothing.
+func (e *Environment) Charge(n int64) error {
+	if e == nil || !e.memoryLimited || n <= 0 {
+		return nil
+	}
+	return e.callCounter().guard.charge(n)
+}
+
+// Refund returns n bytes charged by an estimate that turned out too high.
+func (e *Environment) Refund(n int64) {
+	if e != nil && e.memoryLimited && n > 0 {
+		g := e.callCounter().guard
+		g.memUsed = max(g.memUsed-n, 0)
+	}
+}
+
+func (g *guardState) charge(n int64) error {
+	if n > g.memLimit-g.memUsed {
+		g.memUsed = g.memLimit
+		return &JSONataError{
+			Code:    "D1014",
+			Message: fmt.Sprintf("Evaluation exceeded the memory budget of %d bytes", g.memLimit),
+		}
+	}
+	g.memUsed += n
+	return nil
 }
 
 // Range iterates over the bindings in this environment (not parents).
@@ -527,6 +601,13 @@ type SignedBuiltin struct {
 	// CallsLambdas reports that a wrapper calls only lambdas directly, so
 	// the call depth bounds it and it spends no nesting budget.
 	CallsLambdas bool
+	// Cost, when set, bounds what a call with args allocates: at least the
+	// bytes of its result itself (see ShallowSize), and the bytes of all it
+	// allocates besides, the values its result holds included. Under WithMemoryBudget both are
+	// charged before the call, and the first is settled to the result's size
+	// after it. It may stop measuring once a size passes limit, the budget
+	// left, returning a size above it.
+	Cost func(args []any, limit int64) (result, scratch int64)
 }
 
 // isWrapper reports whether sb is a partial application, composition or

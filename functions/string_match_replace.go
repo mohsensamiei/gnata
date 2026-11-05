@@ -40,7 +40,10 @@ func makeFnMatch(evalFn EvalFn) evaluator.EnvAwareBuiltin {
 		}
 
 		var result []any
-		err = eachRegexMatch(re, s, limit, func(m *evaluator.Match) error {
+		err = eachRegexMatch(re, s, limit, env, func(m *evaluator.Match) error {
+			if err := env.Charge(matchObjectBytes(m)); err != nil {
+				return err
+			}
 			result = append(result, matchResult(evaluator.NewMatchObject(s, m)))
 			return env.CheckSequence(len(result))
 		})
@@ -81,9 +84,12 @@ func matchCountLimit(limit float64) int {
 // matcher yields them, at most limit of them (-1 for no limit). Like
 // jsonata-js it finds the next match before checking the limit, so an empty
 // match after the last one visited still raises D1004.
-func eachRegexMatch(re *evaluator.Regex, s string, limit int, visit func(*evaluator.Match) error) error {
+func eachRegexMatch(re *evaluator.Regex, s string, limit int, env *evaluator.Environment, visit func(*evaluator.Match) error) error {
 	if limit == 0 {
 		return nil
+	}
+	if err := re.ChargeMatches(s, env); err != nil {
+		return err
 	}
 	m, err := re.FindStringMatch(s)
 	for count := 0; err == nil && m != nil && (limit < 0 || count < limit); count++ {
@@ -197,6 +203,9 @@ func makeFnReplace(evalFn EvalFn) evaluator.EnvAwareBuiltin {
 			}
 			switch repl := args[2].(type) {
 			case string:
+				if err := chargeLiteralReplace(s, pattern, repl, limit, env); err != nil {
+					return nil, err
+				}
 				if limit < 0 {
 					return strings.ReplaceAll(s, pattern, repl), nil
 				}
@@ -215,7 +224,7 @@ func makeFnReplace(evalFn EvalFn) evaluator.EnvAwareBuiltin {
 				return nil, err
 			}
 			if repl, ok := args[2].(string); ok {
-				return replaceRegexString(s, re, repl, limit)
+				return replaceRegexString(s, re, repl, limit, env)
 			}
 			return replaceWithFn(s, re, args[2], limit, evalFn, env)
 
@@ -223,6 +232,24 @@ func makeFnReplace(evalFn EvalFn) evaluator.EnvAwareBuiltin {
 			return nil, &evaluator.JSONataError{Code: "T0410", Message: "$replace: argument 2 must be a string or regex"}
 		}
 	}
+}
+
+// chargeLiteralReplace charges replacing old by replacement in s, at most
+// limit times (-1 for no limit): the result, twice over for the builder
+// replaceNLiteral grows.
+func chargeLiteralReplace(s, old, replacement string, limit int, env *evaluator.Environment) error {
+	if !env.MemoryLimited() {
+		return nil
+	}
+	n := strings.Count(s, old)
+	if limit >= 0 {
+		n = min(n, limit)
+	}
+	size := int64(len(s)) + int64(n)*int64(len(replacement)-len(old))
+	if limit >= 0 {
+		size *= 2
+	}
+	return env.Charge(size)
 }
 
 func replaceNLiteral(s, old, replacement string, limit int) string {
@@ -322,14 +349,17 @@ func expandJSONataReplacement(repl, fullMatch string, groups []string) string {
 }
 
 // replaceRegexString replaces regex matches with a JSONata template string.
-func replaceRegexString(s string, re *evaluator.Regex, repl string, limit int) (string, error) {
-	return replaceRegex(s, re, limit, func(m *evaluator.Match) (string, error) {
+func replaceRegexString(s string, re *evaluator.Regex, repl string, limit int, env *evaluator.Environment) (string, error) {
+	return replaceRegex(s, re, limit, env, func(m *evaluator.Match) (string, error) {
 		return expandJSONataReplacement(repl, m.String(), m.Groups()), nil
 	})
 }
 
 func replaceWithFn(s string, re *evaluator.Regex, fn any, limit int, evalFn EvalFn, env *evaluator.Environment) (any, error) {
-	return replaceRegex(s, re, limit, func(m *evaluator.Match) (string, error) {
+	return replaceRegex(s, re, limit, env, func(m *evaluator.Match) (string, error) {
+		if err := env.Charge(matchObjectBytes(m)); err != nil {
+			return "", err
+		}
 		val, err := evalFn(fn, []any{replacerMatchObject(s, m)}, env)
 		if err != nil {
 			return "", err
@@ -343,13 +373,19 @@ func replaceWithFn(s string, re *evaluator.Regex, fn any, limit int, evalFn Eval
 }
 
 // replaceRegex replaces the matches of re in s, at most limit of them (-1 for
-// no limit), with what replacement returns for each.
-func replaceRegex(s string, re *evaluator.Regex, limit int, replacement func(*evaluator.Match) (string, error)) (string, error) {
+// no limit), with what replacement returns for each. Each piece is charged
+// twice over before it is written, for the builder that grows to hold it.
+func replaceRegex(
+	s string, re *evaluator.Regex, limit int, env *evaluator.Environment, replacement func(*evaluator.Match) (string, error),
+) (string, error) {
 	var b strings.Builder
 	prev := 0
-	err := eachRegexMatch(re, s, limit, func(m *evaluator.Match) error {
+	err := eachRegexMatch(re, s, limit, env, func(m *evaluator.Match) error {
 		sub, err := replacement(m)
 		if err != nil {
+			return err
+		}
+		if err := env.Charge(2 * int64(m.Index-prev+len(sub))); err != nil {
 			return err
 		}
 		b.WriteString(s[prev:m.Index])
@@ -358,6 +394,9 @@ func replaceRegex(s string, re *evaluator.Regex, limit int, replacement func(*ev
 		return nil
 	})
 	if err != nil {
+		return "", err
+	}
+	if err := env.Charge(2 * int64(len(s)-prev)); err != nil {
 		return "", err
 	}
 	b.WriteString(s[prev:])
@@ -403,10 +442,10 @@ func compileRegexArg(v any) (*evaluator.Regex, error) {
 	}
 }
 
-func splitRegex(re *evaluator.Regex, s string, limit int) ([]string, error) {
+func splitRegex(re *evaluator.Regex, s string, limit int, env *evaluator.Environment) ([]string, error) {
 	var parts []string
 	lastEnd := 0
-	err := eachRegexMatch(re, s, limit, func(m *evaluator.Match) error {
+	err := eachRegexMatch(re, s, limit, env, func(m *evaluator.Match) error {
 		parts = append(parts, s[lastEnd:m.Index])
 		lastEnd = m.Index + m.Length
 		return nil
@@ -418,4 +457,10 @@ func splitRegex(re *evaluator.Regex, s string, limit int) ([]string, error) {
 		parts = append(parts, s[lastEnd:])
 	}
 	return parts, nil
+}
+
+// matchObjectBytes is what the match object of m costs: the object, its
+// groups array and the object $match or a replacement function receives.
+func matchObjectBytes(m *evaluator.Match) int64 {
+	return 2*evaluator.ObjectBytes + 6*evaluator.EntryBytes + int64(len(m.Groups())+2)*evaluator.ElementBytes
 }

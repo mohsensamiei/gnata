@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/recolabs/gnata/internal/errs"
 )
 
 // Lexer tokenizes a JSONata expression.
@@ -19,8 +21,10 @@ func NewLexer(src string) *Lexer {
 	return &Lexer{src: src}
 }
 
-func lexError(code, msg string) error {
-	return fmt.Errorf("JSONata error %s: %s", code, msg)
+// lexError returns a lexer error at byte offset pos, where jsonata-js
+// reports it, about token tok.
+func lexError(code string, pos int, tok, msg string) error {
+	return errs.Syntax(code, tok, pos, msg, fmt.Sprintf("JSONata error %s: %s", code, msg))
 }
 
 // isStopChar reports whether ch is a character that terminates identifier scanning.
@@ -103,7 +107,16 @@ func lenientRegexEnd(src string, start int) (int, bool) {
 // Next returns the next token.
 // infix=true means we are after a value (closing bracket, identifier, etc.).
 // infix=false means we are in prefix position; a '/' starts a regex literal.
-func (l *Lexer) Next(infix bool) (Token, error) { //nolint:gocyclo,funlen // dispatch
+func (l *Lexer) Next(infix bool) (Token, error) {
+	tok, err := l.next(infix)
+	if tok.Type == TokenEOF {
+		tok.Pos = len(l.src)
+	}
+	tok.End = l.pos
+	return tok, err
+}
+
+func (l *Lexer) next(infix bool) (Token, error) { //nolint:gocyclo,funlen // dispatch
 	// After a comment or an unrecognized character, scanning starts over
 	// here: a loop rather than recursion, so a long run of them cannot
 	// exhaust the stack.
@@ -132,7 +145,7 @@ start:
 				goto start
 			}
 		}
-		return Token{}, lexError("S0106", "unclosed block comment")
+		return Token{}, lexError("S0106", startPos, "", "unclosed block comment")
 	}
 
 	// Regex literal — only in prefix position.
@@ -146,7 +159,7 @@ start:
 		if closed {
 			pattern := l.src[patStart:end]
 			if pattern == "" {
-				return Token{}, lexError("S0301", "empty regex pattern")
+				return Token{}, lexError("S0301", end, "", "empty regex pattern")
 			}
 			l.pos = end + 1 // consume closing '/'
 
@@ -167,7 +180,7 @@ start:
 			}, nil
 		}
 		l.pos = len(l.src)
-		return Token{}, lexError("S0302", "unterminated regex")
+		return Token{}, lexError("S0302", l.pos, "", "unterminated regex")
 	}
 
 	// Two-character operators — must be checked before single-character.
@@ -224,7 +237,7 @@ start:
 			l.pos++
 		}
 		if l.pos >= len(l.src) {
-			return Token{}, lexError("S0105", "unterminated backtick name")
+			return Token{}, lexError("S0105", l.pos, "", "unterminated backtick name")
 		}
 		name := l.src[nameStart:l.pos]
 		l.pos++
@@ -321,7 +334,7 @@ func (l *Lexer) scanString(quote byte, startPos int) (Token, error) {
 		// Escape sequence.
 		l.pos++
 		if l.pos >= len(l.src) {
-			return Token{}, lexError("S0103", "invalid escape sequence at end of input")
+			return Token{}, lexError("S0103", l.pos, "", "invalid escape sequence at end of input")
 		}
 		esc := l.src[l.pos]
 		l.pos++
@@ -330,15 +343,17 @@ func (l *Lexer) scanString(quote byte, startPos int) (Token, error) {
 			continue
 		}
 		if esc != 'u' {
-			return Token{}, lexError("S0103", "invalid escape sequence: \\"+string(esc))
+			r, _ := utf8.DecodeRuneInString(l.src[l.pos-1:])
+			return Token{}, lexError("S0103", l.pos-1, string(r), "invalid escape sequence: \\"+string(esc))
 		}
 		hex := l.src[l.pos:min(l.pos+4, len(l.src))]
 		if hex == "" || strings.Trim(hex, "0123456789abcdefABCDEF") != "" {
-			return Token{}, lexError("S0104", "invalid unicode escape: \\u"+hex)
+			return Token{}, lexError("S0104", l.pos-1, "", "invalid unicode escape: \\u"+hex)
 		}
 		if len(hex) < 4 {
-			// jsonata-js accepts the short escape and then runs out of input.
-			return Token{}, lexError("S0101", "unterminated string literal")
+			// jsonata-js accepts the short escape, steps four characters
+			// past the u and one more, and then runs out of input.
+			return Token{}, lexError("S0101", l.pos+4, "", "unterminated string literal")
 		}
 		r, _ := strconv.ParseInt(hex, 16, 32) // four hex digits, checked above
 		l.pos += 4
@@ -352,7 +367,7 @@ func (l *Lexer) scanString(quote byte, startPos int) (Token, error) {
 		}
 		sb.WriteRune(rune(r))
 	}
-	return Token{}, lexError("S0101", "unterminated string literal")
+	return Token{}, lexError("S0101", l.pos, "", "unterminated string literal")
 }
 
 // scanNumber scans a numeric literal starting at startPos (first char is a digit).
@@ -395,7 +410,7 @@ func (l *Lexer) scanNumber(startPos int) (Token, error) {
 	numStr := l.src[numStart:l.pos]
 	f, err := strconv.ParseFloat(numStr, 64)
 	if err != nil || math.IsInf(f, 0) || math.IsNaN(f) {
-		return Token{}, lexError("S0102", "invalid number literal: "+numStr)
+		return Token{}, lexError("S0102", startPos, numStr, "invalid number literal: "+numStr)
 	}
 	return Token{Type: TokenNumber, Value: numStr, NumVal: f, Pos: startPos}, nil
 }

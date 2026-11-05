@@ -5,6 +5,7 @@ import (
 	"math"
 	"slices"
 
+	"github.com/recolabs/gnata/internal/errs"
 	"github.com/recolabs/gnata/internal/parser"
 )
 
@@ -859,6 +860,11 @@ func equalItems(frame *equalFrame, eq equality) (bool, error) {
 				if !path.enter(child.self) {
 					return false, nil
 				}
+				// Opening a pair can allocate its items, and a value sharing
+				// containers at many levels opens exponentially many.
+				if err := eq.env.Charge(callBytes + ElementBytes*int64(len(child.a)+len(child.b))); err != nil {
+					return false, err
+				}
 				stack = append(stack, *frame)
 				*frame = child
 			}
@@ -1021,24 +1027,10 @@ func equalShallow(a, b any, eq equality, frame *equalFrame) (open, equal bool) {
 	return false, false
 }
 
-// JSONataError is the structured error type used throughout evaluation.
-// Code matches the JSONata spec error codes (S0xxx, T0xxx, T1xxx, T2xxx, D1xxx, D2xxx, D3xxx).
-type JSONataError struct {
-	Code    string
-	Token   string
-	Value   any
-	Message string
-}
-
-func (e *JSONataError) Error() string {
-	if e.Message != "" && e.Code != "" {
-		return e.Code + ": " + e.Message
-	}
-	if e.Message != "" {
-		return e.Message
-	}
-	return e.Code
-}
+// JSONataError is the structured error type used throughout evaluation (see
+// errs.Error). Code matches the JSONata spec error codes (S0xxx, T0xxx,
+// T1xxx, T2xxx, D1xxx, D2xxx, D3xxx).
+type JSONataError = errs.Error
 
 // ToIntClamped truncates a JSONata number to int, saturating outside the int32
 // range. A plain int() of an out-of-range float is implementation-defined, and

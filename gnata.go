@@ -18,10 +18,19 @@ import (
 
 	"github.com/recolabs/gnata/functions"
 	"github.com/recolabs/gnata/internal/decimal"
+	"github.com/recolabs/gnata/internal/errs"
 	"github.com/recolabs/gnata/internal/evaluator"
 	"github.com/recolabs/gnata/internal/parser"
 	"github.com/tidwall/gjson"
 )
+
+// Error is the structured error Compile and the Eval methods return for a
+// JSONata error: errors.As(err, &e) with e of type *Error gives its Code,
+// Token, Value and Position. Position is a character index into the
+// expression in UTF-16 code units, the position jsonata-js 2.2 reports, so
+// it can be used directly against a JavaScript string; 0 means none (or the
+// very start of the expression).
+type Error = evaluator.JSONataError
 
 // Expression is a compiled, reusable, goroutine-safe JSONata expression.
 type Expression struct {
@@ -54,6 +63,7 @@ type compileOptions struct {
 	timeout          time.Duration
 	sequence         int
 	decimalPrecision int
+	memoryBudget     int64
 }
 
 // Option configures a compiled Expression: a resource guardrail (WithStack,
@@ -102,6 +112,36 @@ func WithTimeout(d time.Duration) Option {
 // (D2014 / D3010) apply.
 func WithSequence(n int) Option {
 	return func(o *compileOptions) { o.sequence = n }
+}
+
+// WithMemoryBudget limits the memory one evaluation may allocate to bytes.
+// Exceeding it returns error D1014, a gnata extension that jsonata-js lacks
+// (jsonata-js already uses D1013, for property names starting _jsonata_).
+// Without this option there is no such limit.
+//
+// Go cannot cap or stop one goroutine's memory, so the evaluator accounts
+// for it: each allocation whose size depends on the data is charged before
+// it is made, so a value that would exceed the budget fails before it is
+// built. That covers strings built by concatenation (&), $string, $join,
+// $pad, $replace, $substring, $uppercase, $lowercase, $base64encode,
+// $encodeUrl and the other string functions; arrays built by constructors,
+// the range operator, $append, $map, $filter, $split, $spread, $keys, $sort
+// and the other array functions, and wildcard (*) and descendant (**)
+// results; objects built by constructors, group-by and $merge, and the copy
+// a transform makes; the matches of a regex; and the scope of every block
+// and function call. Sizes are estimates, a little above what the Go
+// runtime spends on a 64-bit target: the bytes of each string, plus a fixed
+// overhead per array element, object entry and call.
+//
+// Charges are never returned: the budget bounds what the evaluation
+// allocates in all, garbage included, so the heap cannot grow by much more
+// than the budget during the evaluation, whatever the garbage collector's
+// timing. A long loop spends the budget even when it keeps little; a lambda
+// call costs about 160 bytes, so $map over a million items needs a budget
+// of a few hundred megabytes. Decoding the input is not charged. Combine
+// the budget with WithTimeout, which bounds the time an evaluation spends.
+func WithMemoryBudget(bytes int64) Option {
+	return func(o *compileOptions) { o.memoryBudget = bytes }
 }
 
 // WithDecimalPrecision enables decimal arithmetic and comparison of numbers,
@@ -275,6 +315,9 @@ func (e *Expression) evalCore(ctx context.Context, data any, parent *evaluator.E
 		if e.options.decimalPrecision > 0 {
 			env.SetDecimalPrecision(e.options.decimalPrecision)
 		}
+		if e.options.memoryBudget > 0 {
+			env.SetMemoryBudget(e.options.memoryBudget)
+		}
 	}
 	env.Bind("$", data)
 	env.SetRootInput(data)
@@ -286,7 +329,7 @@ func (e *Expression) evalCore(ctx context.Context, data any, parent *evaluator.E
 		if env.DeadlineExceeded() {
 			return nil, &evaluator.JSONataError{Code: "D1012", Message: fmt.Sprintf("Evaluation timeout after %s", e.options.timeout)}
 		}
-		return nil, err
+		return nil, errs.InUTF16(e.src, err)
 	}
 	if seq, ok := result.(*evaluator.Sequence); ok {
 		result = evaluator.CollapseSequence(seq)
