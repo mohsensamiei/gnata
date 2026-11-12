@@ -3,6 +3,7 @@ package lexer
 import (
 	"fmt"
 	"math"
+	"regexp"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -171,6 +172,13 @@ start:
 				l.pos++
 			}
 			flags.WriteByte('g')
+
+			// Go's RE2 has no lookaround or backreferences, which jsonata-js
+			// accepts: reject such a pattern here, with its position, rather
+			// than when it is first used.
+			if _, err := regexp.Compile(pattern); err != nil {
+				return Token{}, lexError("S0303", l.pos, "", "invalid regular expression: "+err.Error())
+			}
 
 			return Token{
 				Type:     TokenRegex,

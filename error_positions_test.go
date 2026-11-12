@@ -133,3 +133,35 @@ func TestErrorPositionsAPI(t *testing.T) {
 		t.Errorf("syntax error message changed: %v", err)
 	}
 }
+
+// TestCompileRejectsInvalidRegex checks that Compile rejects a regex literal
+// Go's RE2 cannot compile (a lookaround or a backreference, which jsonata-js
+// accepts, or a bad repeat), with S0303 at the end of the literal, and never
+// later at evaluation.
+func TestCompileRejectsInvalidRegex(t *testing.T) {
+	for _, tc := range []struct {
+		expr     string
+		position int
+	}{
+		{`$match(name, /a(?=b)/)`, 21},
+		{`$replace(name, /(a)\1/, "x")`, 22},
+		{`$contains(name, /(?<=a)b/i)`, 26},
+		{`$match(name, /a{2,1}/)`, 21},
+		// Positions count UTF-16 code units, as the other errors' do.
+		{"(\"نام\u200cخانوادگی 🙂\"; $match(name, /a(?!b)/))", 41},
+	} {
+		_, err := gnata.Compile(tc.expr)
+		var e *gnata.Error
+		if !errors.As(err, &e) {
+			t.Fatalf("%q: Compile gave %v, want a *gnata.Error", tc.expr, err)
+		}
+		if e.Code != "S0303" || e.Position != tc.position {
+			t.Errorf("%q: got %s at %d, want S0303 at %d", tc.expr, e.Code, e.Position, tc.position)
+		}
+	}
+	for _, expr := range []string{`$match(name, /a(b)c/i)`, `$split(name, /[,;]\s*/)`, `/[)]/`, `/(a})/`} {
+		if _, err := gnata.Compile(expr); err != nil {
+			t.Errorf("%q: Compile gave %v, want no error", expr, err)
+		}
+	}
+}

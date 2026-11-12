@@ -301,8 +301,12 @@ func TestLexerRegex(t *testing.T) {
 			"g", false, "",
 		},
 		// As in jsonata-js, a bracket right after a '\' opens nothing, even
-		// when that '\' is itself escaped, so the next / closes the regex.
-		{"bracket after an escaped backslash", `/\\(/x)/`, `\\(`, "g", false, ""},
+		// when that '\' is itself escaped, so the next / closes the regex,
+		// whose pattern \\( then fails to compile, as in jsonata-js.
+		{"bracket after an escaped backslash", `/\\(/x)/`, "", "", true, "S0303"},
+		// RE2 has no lookaround or backreferences: rejected while lexing.
+		{"lookahead", `/a(?=b)/`, "", "", true, "S0303"},
+		{"backreference", `/(a)\1/`, "", "", true, "S0303"},
 		// jsonata-js's one depth count, classes included, closes these.
 		{"} closing a { left open in a group", `/(a{)}/`, `(a{)}`, "g", false, ""},
 		{") and ] closing { and [ in a group", `/({[)])/`, `({[)])`, "g", false, ""},
